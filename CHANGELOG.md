@@ -7,9 +7,847 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-19
+
+### Added
+
+- Pair an iPhone from **Settings → Connections → Your phones** to browse projects and conversations, start and continue sessions, follow streamed replies, stop responses, and view code changes. The iPhone companion is currently an **invite-only TestFlight beta**.
+- Swipe between projects in the new sidebar.
+- Project and Inbox actions have keyboard-accessible context menus in the new sidebar.
+
+### Fixed
+
+- The new sidebar keeps **Open project** and **Settings** available before a project is selected.
+- The empty conversation view no longer scrolls a few pixels around the message input.
+- The message input's blurred background stays within its rounded corners on Windows.
+- Phone connections on Windows accept both IPv4 and IPv6.
+
+## [0.15.0] - 2026-10-18
+
+### Added
+
+- An optional **New layout** brings a redesigned sidebar, project switcher, workspace tabs and right panel. Try it from the invitation or Settings > Appearance > Layout, where it can also be turned off to return to the classic layout. Glass remains a separate setting.
+- A **Resource pressure** indicator in the usage footer opens a process view with CPU and memory usage, controls to stop agents and sessions, and controls to stop individual running tools. In #1045 by @hardbeat920.
+- **Smooth text reveal** in Settings → Chat controls whether incoming reply bursts appear gradually or immediately. It is enabled by default. In #1045 by @hardbeat920.
+- The new layout's right panel has a **History** tab with a searchable, refreshable Git history graph. Its tabs can be dragged to reorder.
+- A session that hits a usage limit can **continue on another provider account**. Claude and Codex conversations are copied to the chosen account so the same session resumes there; if the copy fails, it continues from a handoff summary.
+- Sessions started by an operator are grouped under the session that started them in the sidebar.
+
+### Changed
+
+- The footer's **High usage** warning opens a compact view of running sessions, with one Stop button per session. Process details expand when needed, and long lists scroll inside the dialog.
+- Large conversations and busy workspaces stay more responsive: recent transcripts retain their rendered state across tab switches, code highlighting and large diffs run in workers, and navigation avoids unnecessary layout measurements. Large tool output loads when expanded. In #1045 by @hardbeat920.
+- Background Git work and agent tool processes receive lower scheduling priority where supported. Resource pressure reduces retained transcript memory while preserving session history. In #1045 by @hardbeat920.
+- In the new layout, the **terminal panel and split panes slide** open and closed, pushing the workspace aside. A file pane slides in with its tabs and fades its contents in once loaded.
+- Code in the editor, diffs, and replies uses the **VS Code Dark+ and Light+** colors, with a shared code font size for the editor and diffs.
+- Review tabs stay open across editor navigation, keeping their folds and scroll position. Unified diffs render faster, with syntax highlighting in the background, and commit diffs are not refetched when shown again.
+- In the new layout, the session sidebar shortcut (⌘⇧B) toggles the right panel, and Inbox, Notes, and Automations show the active project's items.
+- Glass in the new layout uses native macOS blur.
+- Session review cards and the message queue have lighter, more consistent styling.
+
+### Fixed
+
+- Turning off **Transparent window** keeps the new layout opaque when themes change, including native appearance updates before the layout has mounted. The setting now clearly describes its transparency behavior.
+- Completing a reply, changing a file pane's width, or returning to a cached conversation preserves the reader's position and keeps a following conversation at its reply. Completed provider bursts continue their text reveal without jumping the transcript. In #1045 by @hardbeat920.
+- Session streaming avoids unnecessary background rerenders and repeated history work. Composer resizing and decorative transcript measurements no longer force repeated workspace layout during navigation. In #1045 by @hardbeat920.
+- Notification sounds suspend their audio context after playback finishes, reducing idle resource use. In #1045 by @hardbeat920.
+- Moving focus no longer rechecks the whole page's styles, which took about 45 ms with a long transcript open. In #1038 by @zcy22606.
+- Agent tool calls no longer rebuild every open composer's @-mention index when nothing on disk changed. In #1029 by @zcy22606.
+- Keystrokes no longer search the whole page for an active shortcut recorder. In #1028 by @zcy22606.
+- Revisiting a tab no longer replays its transcript animations.
+- Closing tabs around Mono and app view tabs keeps the right workspace visible, and switching between them no longer flickers.
+- Title bars and the project rail leave room for the window controls in macOS full screen.
+- Model pickers and popovers fit short or zoomed windows without clipping rows.
+- Empty sessions lay out correctly in narrow or short panes.
+- Translucent cards render without flicker on macOS.
+
+
+## [0.14.0] - 2026-10-17
+
+### Added
+
+- The Mono overview has an **Activity** tab showing its current work and completed activity. Reports from habit runs also list the sessions they started.
+- Project groups in the rail support **drag to reorder**. In #787 by @nwoolls.
+- The compact rail has instant hover tooltips and an unseen-reply dot on its Sessions tab.
+- Remote hosts can run on **Linux without systemd**, including containers and Firecracker microVMs. Setup uses a detached background process there and reconnecting starts it again if needed; machines with systemd keep their user service and lingering. In #990 by @pdparchitect.
+- The workspace tab context menu has **Close All Tabs**, with the same unsaved-file and terminal confirmations as the File menu. In #1005 by @pdparchitect.
+- Syntax highlighting supports **Vue, Svelte, SCSS, Sass, and Less files**. In #892 by @RealDewKJ.
+- The editor highlights **.env files**. In #915 by @MrWeb.
+- Terminal hyperlinks can be clicked to open them. In #782 by @nwoolls.
+- Notification sounds also play when an agent asks a question or needs approval. In #801 by @kartava.
+- The keybindings settings list the Escape shortcut for stopping a run. In #897 by @RealDewKJ.
+
+### Changed
+
+- Mono chats use a more compact composer and model controls in narrow panes. Replies no longer have bubble tails, the Mono introduction appears as an inline rail card, unread badges use the accent color, and document readers have tighter spacing.
+- Model pickers group **omp, Pi, and Hermes** models by provider. In #765 by @nwoolls.
+- Claude model labels make their versions easier to distinguish. In #937 by @oskar-albers.
+- Pi and Codex turn token totals include every request in the turn. In #884 by @zcy22606.
+- Previewable files remember the last **Preview or Source** choice. In #929 by @ognjeeen.
+
+### Fixed
+
+- Typing in a composer on macOS no longer rechecks the whole page's styles for each keystroke. In #985 by @zcy22606.
+- The composer runner stops its animation loop while its tab is in the background. In #975 by @zcy22606.
+- A blank session keeps the provider account selected for its own project. In #967 by @watzon.
+- Saved Claude model versions show their settings on first open. In #938 by @50BytesOfJohn.
+- omp model discovery loads extensions. In #846 by @Plume-coder.
+- Asynchronously registered Pi provider models are awaited during discovery. In #921 by @pchuri.
+- Skills remain discoverable when their 16 KiB preview ends partway through a UTF-8 character. In #978 by @keyCat.
+- Replayed Claude background-task notifications no longer end a resumed turn early. In #532 by @itizarsa.
+- A consumed handoff recap is not resent on later turns. In #880 by @zcy22606.
+- Refused fast mode is not reported as a session usage limit. In #958 by @zcy22606.
+- Punctuation-only assistant text does not create a transcript reply. In #763 by @Erickzao.
+- Sending a message during a running turn preserves its existing clock. In #1021 by @zcy22606.
+- Title-bar and Mono overview buttons keep consistent sizing, and branch and commit menus remain anchored to their controls.
+- A session whose worktree was deleted outside the app can select another checkout. In #883 by @zcy22606.
+- Remote session diffs use their linked worktree. In #887 by @santhiprakash.
+- Quoted Git diff paths are read literally. In #815 by @Slowper.
+- Git LFS works when MonoCode is launched from Finder: Git commands include Homebrew and other common install locations on their PATH, plus the terminal's PATH once available. In #1004 by @pdparchitect.
+- Selecting the **whole last paragraph** of a reply opens the Add to chat and Add to notes menu. In #1001 by @pdparchitect.
+- Wrapped diff lines place scrollbar change markers at their rendered positions. In #1002 by @pdparchitect.
+- **Markdown file previews** display local Markdown and HTML images, including centered headers, tables, and picture elements, while preserving dimensions and alignment. Paths resolve within the project; missing, invalid, remote, or out-of-project images fall back to their alt text. In #1027 by @pdparchitect.
+- Right-clicking empty window space no longer opens a native menu offering only **Reload**. Reload remains in the View menu, and controls keep their applicable native menus. In #1003 by @pdparchitect.
+- The footer's **Terminal** button toggles its panel and reflects its pressed state. In #784 by @rxchitrx.
+- HTML artifacts render their surface, muted, and border theme colors opaquely. In #1020 by @rxchitrx.
+- macOS development bundles retain correct version metadata. In #983 by @MRKups.
+
+## [0.13.0] - 2026-10-12
+
+### Added
+
+- Monos and habit runs can create **HTML visual artifacts** with `app artifacts.write` using `kind: "html"`, alongside Markdown documents. Visuals run in a sandboxed frame, follow the app's theme, fit their content height, and refresh when revised. Scripts and public HTTPS assets are supported; access to the app, network requests through fetch, nested frames, and form submissions are blocked. Clicked web links open in the user's browser.
+- Mono replies display linked **local images and videos inline**, including workspace-relative media references. Images open in the file viewer when clicked, and videos have playback controls. Previews load as they approach the visible chat, reserve their space to avoid layout shifts, and fall back to the original link when a linked file cannot be displayed. Local videos stream without reading the whole file into memory; only the requested video file is added to the asset scope.
+- The Mono composer has an **emoji picker** with search, categories, recent picks, and a saved skin-tone preference. Picks replace the selected text or insert at the caret and return focus to the composer. Its bundled catalog works offline across platforms and filters out emoji versions and country flags the system's font cannot draw.
+- **Model and effort controls** sit beneath the Mono composer, alongside its context usage meter. Compact plan-usage chips show Claude Code, Codex, OpenCode, and Devin usage beside the attachment and emoji buttons when available.
+- Sessions a Mono starts appear as **status cards beneath its replies**, showing their title, provider, project, and whether they are working, need input, are drafts, failed, stopped, or finished. Cards open the session inside the overview and remain visible when a later completion report continues the turn.
+- The Mono overview's Sessions tab has **search and filters** for provider, status, time, archived sessions, and unavailable sessions. Search also matches project names. Sessions appear newest first and load another page as the list nears its end; changing the search or filters resets paging. Empty tabs and searches show guidance for the current state.
+- MonoCode **reopens the last open Mono on launch** when it still exists and Monos are enabled. Closing the Mono clears that choice, and windows transferred from another window retain their own view.
+
+### Changed
+
+- A unified **Mono overview** replaces the separate details, sessions, artifacts, and changes sidebars, with Sessions, Documents, Habits, and Changes tabs. It opens beside the chat by default and can be toggled from the title bar. The default width is 400 pixels, and resizing allows up to 960 pixels or 62% of the window. Tabs show item counts; the folded Changes icon has an accent dot when changes are present.
+- Mono settings open in a **dialog** from the title bar, with General, Soul, and Memory sections. General brings together model settings, permissions, projects, sidebar preferences, and conversation reset. Clicking the mascot opens the mascot and color popover, and the name field sits directly beneath it.
+- Mono-started sessions launch without creating workspace tabs by default and open over the overview's session list, with **Back**, **Open in workspace**, and **Hide overview** controls. New launches stay out of the project sidebar unless **Show sessions in sidebar** is enabled in that Mono's settings; optional folder grouping remains available.
+- The overview's **Changes** tab groups repositories into project tabs with their logo or mascot and changed-file count. Worktrees share their project's tab and have a checkout picker. Attached Git projects appear even before they have changes, and repositories remain available after committing so their work can still be pushed. Each checkout retains its commit draft when switching projects or overview tabs.
+- Mono commits now use the repository's **real Git staging area**, shared with the project's Changes panel. The view lists staged and unstaged files, supports staging or unstaging files, folders, or all changes, and offers discard, list/tree views, commit, push, sync, and pull request actions. Generated messages and commits use all staged changes in the active checkout. Fully committed Mono files leave its session review; partially staged files retain their remaining review.
+- Clicking a changed file opens its **inline diff editor** over the Changes list, with Back navigation. Changed images and videos open in the media preview instead.
+- Documents and visuals open inside the overview's **Documents** tab. Reply cards use compact title chips with document or chart icons, and the reader keeps its title in the navigation header without repeating the title and update timestamp above the content. Copy and delete controls remain available.
+- Mono session cards show their project and place the model's provider mark beside the branch in the footer, revealing the model name on hover or focus so titles have more room.
+- Habits in the overview are grouped into **Up next today**, **Done today**, and **Later**, with group counts and paused habits last. When nothing is scheduled today, the remaining group is labeled Scheduled.
+- Streamed replies show text **as it arrives**, with word fades adapting to the stream's cadence between 120 and 400 milliseconds. The earlier paced reveal remains available through `localStorage["monocode.pacedReveal"] = "1"`. Transcript following glides with incoming content, bounds the speed of Mono reply reveals, and respects entrance-animation settings.
+- Mono turn actions appear on hover or keyboard focus in a reserved gap and stay visible while their panel is open. Reaction badges use translucent chips at the message corner, and the next user message stacks with a message answered only by a reaction. Handoff and second-opinion controls are hidden in the Mono view.
+- New conversations show an **empty context ring** before usage is reported. A zero-usage ring no longer draws a progress dot.
+- Regression coverage now includes Mono overview navigation, settings and popovers, memory editing, session search and paging, habit grouping, multi-repository staging and commits, HTML artifact persistence, local media references, session-state synchronization, Cursor catalog fallbacks, emoji data, and reply pacing. Chromium and WebKit tests cover the emoji picker, tab drags, Mono completion layout, and interrupted scroll glides; Linux drag fixtures mock native window controls, and wheel-interruption checks wait for scrolling to settle.
+
+### Fixed
+
+- Cursor model discovery uses existing CLI credentials without starting the **browser login flow**. Missing credentials or ACP failures fall back to CLI discovery and then the bundled model catalog.
+- Background agent updates preserve pending **account changes, session titles, newly opened sessions, and streamed output** when several updates arrive before React renders, including under Strict Mode.
+- Switching Monos clears the previous Mono's open session, document, focus, search, and filters so its overview does not leak into another conversation.
+- Saved Mono session summaries and habits are cached so returning to their lists avoids a blank reload. Session lookup also finds saved sessions moved to another project; loading cards reserve their space, and unavailable sessions can be inspected through the filter.
+- Reused sessions are recovered from successful **follow-up receipts** as well as launch receipts, using saved metadata or session listings. Merely listing or reading a session does not create a chat card.
+- Completion reports and session cards attach without shifting Mono transcript spacing or interrupting reply fades. Ready completion prompts stay hidden while being delivered; waiting or failed prompts remain visible, including failures that need a retry.
+- Manual scrolling interrupts Mono reply glides, ambiguous wheel gestures pause following, and scrolling a nested code block keeps its own scroll behavior. Following offsets no longer enlarge the transcript's scroll range, and focusing a session during the overview's slide animation no longer scrolls the surrounding panel out of place.
+- Session and artifact cards fit narrow panes, truncating long titles and project labels instead of overflowing their container. Popovers opened from dialogs stay above them, and Escape closes the popover before the dialog.
+- Video previews defer releasing their source until the element is actually gone, preventing Linux WebKit from stalling without metadata when React replays effects during an in-progress load.
+- Opening a particular file in a multi-file diff expands that file even when the other files start folded.
+- Sideways tab drags require a deliberate pull below the tab bar before targeting a pane. Fast releases in WebKit keep their reorder even when queued pointer moves report no held buttons, while missed releases still cancel the drag.
+
+## [0.12.0] - 2026-10-10
+
+### Added
+
+- **Video previews** open common video containers, including MP4, MOV, WebM, and MKV, in the file pane with playback controls, dimensions, duration, file size, and format. Playback depends on the platform's supported codecs; unreadable or unsupported local videos offer retry and external playback.
+- Settings → Providers → Advanced → **Keep idle agents ready** controls how many finished conversations keep their agent CLI running for quick follow-ups. Choose None, 1, 2, 3, or 5; the default is 3. Excess agents stop in order of longest idle time, preserving resume state and favoring the conversation on screen. Running turns are excluded, lowering the limit takes effect immediately, and idle agents otherwise stop after three minutes instead of five.
+- Monos can answer with an **emoji reaction** attached to the user message. Reaction-only replies hide their redundant reply bubble, thinking, and tool activity while retaining errors. New reactions animate with reduced-motion support, and notifications describe the reaction.
+- Mono rail badges show **unread reply counts**, including habit posts, instead of a single dot. Counts clear when the Mono is opened, display up to `99+`, and are included in accessible labels.
+
+### Changed
+
+- A Mono's latest turn that edited files has a compact **changes button** showing added and removed line counts and opening the diff. Ordinary sessions retain the full review card; older transcript pages, drafts, and pending inbox questions do not show an unrelated review.
+- Floating macOS Mono chats use a more compact **440-point width and up to 560-point height**, including the Mono rail, while fitting smaller screen work areas.
+- Native browser scrollbars are hidden throughout the app while preserving horizontal and vertical scrolling. Custom editor and terminal scrollbar controls remain available.
+- Streamed agent output batches stdout lines and server events about once per 16-millisecond window, and foreground chat updates are limited to about 30 per second. Unchanged sidebar, live-agent, and Mono rail data reuse their existing values, and output in other tabs avoids rerendering the visible pane tree.
+- Terminal title polling reads foreground commands directly from `/proc` on Linux and skips process lookups while the shell owns the foreground. The animated terminal background caches static outlines, pauses while hidden, draws only the visible board during transitions, and pulses its cursor only on hover. The resident Quick Composer is prepared only when its shortcut is enabled.
+- The README and contributing guide have shorter quick starts with focused guides for provider setup, platform installation, source builds, and agent access.
+- Regression coverage now includes video playback and hidden-tab pauses in Chromium and WebKit, returning to streamed transcripts, reaction rendering, unread counts, idle-agent limits, shared-turn edit attribution, checkpoint recovery, review caching, and theme synchronization. Checkpoint filename fixtures account for Windows removing trailing spaces, browser tests use more stable playback and animation checks, and CI uploads traces when browser tests fail.
+
+### Fixed
+
+- Theme changes synchronize across open windows, including the color scheme, accent, tint, and dark-theme lightness, without requiring a reload. In #909 by @ognjeeen; fixes #894.
+- **New Window** opens a working window on Windows instead of a blank gray frame caused by creating WebView2 on the main thread. In #908 by @ognjeeen; fixes #907.
+- Launching MonoCode again on Windows restores the running instance and its hidden windows instead of starting another process with a duplicate tray icon. In #905 by @ognjeeen; fixes #860.
+- **Reveal in file manager** runs off the main thread, preventing Linux from becoming unresponsive while `xdg-open` waits for the file manager to close. In #902 by @spuder; fixes #901.
+- Manual wheel, pointer, keyboard, and touch scrolling consistently pause transcript following. Scrolling within nested content stays independent, and layout changes or browser-clamped offsets do not incorrectly stop following.
+- Session reviews retain the original checkpoint boundary across interrupted turns and continuations. Older interrupted checkpoints can recover transcript-confirmed changes for review without enabling unsafe undo. Reviews shared by overlapping sessions display only files supported by that session's successful structured edit tools.
+- Committed changes disappear from the current review and stay dismissed if those files are edited again. Review cards and Mono changes buttons share cached status, refresh after workspace changes, and ignore stale responses from an earlier turn.
+- Returning to a hidden transcript tab does not replay the fade animation for words already shown.
+- Video previews pause when their workspace tab or window is hidden, prevent hidden playback from restarting, and release their source when closed. Restoring a source after React replays effects also restarts loading, preventing a blank preview.
+- Subagent mascots render at the same visual scale as neighboring line icons while keeping a fixed icon slot and stable row alignment.
+
+## [0.11.0] - 2026-10-09
+
+### Added
+
+- **Devin CLI** is available as a provider for local and remote sessions on macOS, Windows, and Linux through ACP. It uses the CLI's existing sign-in on the machine running the session and supports model selection, per-model effort and fast controls, planning, resuming, cancellation, compaction, slash commands, and Devin skills. In #748 by @noursh26.
+- Devin **subagents** appear in the existing agent cards and activity hierarchy, including nested work and child replies. Devin can generate session titles and answer `/btw` side questions; temporary side-question sessions are cleaned up after completion, failure, or cancellation. In #748.
+- Devin account details show the signed-in identity, plan, daily and weekly usage limits and reset times, and extra usage balance. Usage requests keep credentials in the backend and use HTTPS. In #748.
+- Mono chats have a **Changes** panel beside the conversation for reviewing edited files with the existing diff viewer. The **Commit** tab supports selecting files, editing or generating a commit message, committing, pushing, and creating a pull request.
+- Mono reviews group files by their own **Git repository or worktree**, including nested repositories. Each checkout has its own file selection and commit draft, so work across multiple repositories can be reviewed and committed separately. Files outside Git remain available for review.
+- **Turn checkpoints** capture changes before and after a turn in Git workspaces, including edits made through shell commands. Settled turns show their actual diff with keep and undo controls, while preserving changes that were present before the turn.
+- A Mono's **Details → Settings** page controls whether its launched sessions appear in the sidebar and whether they are grouped in a color-coded folder named after the Mono. Resetting the conversation keeps its soul, memory, and habits.
+- Settings → Monos → **Pin monos to the icon rail** places Mono icons above the project picker when the rail is collapsed. The floating Mono rail also shows whether each Mono is working, idle, or waiting for input.
+- Image previews and the image lightbox support **cursor-centered zoom**, modifier-wheel gestures, zoom keyboard shortcuts, and native macOS trackpad pinch gestures. The lightbox also supports dragging to pan and double-clicking to zoom or reset.
+- Settings → Chat → **Autocorrect** controls native spelling and correction behavior in both regular session and Mono composers. The preference persists across restarts and is enabled by default.
+
+### Changed
+
+- Mono commits include only the selected files' current working-copy contents and preserve unrelated staged work, including partial staging. Other existing repository changes are excluded by default, even when already staged. Generated commit context uses a temporary Git index without changing the real staging area or including unselected changes.
+- Mono artifact and changes panels use a wider reader layout. Switching repositories preserves each checkout's selection and draft, and a completed commit clears only its selected files from the Mono review.
+- Large streamed Markdown code blocks reuse highlighted lines and rendered content, reducing rendering work and stalls as output grows. Regression coverage checks correctness and layout in Chromium and WebKit. In #863 by @nwoolls.
+- Regression coverage now includes Devin transport, permissions, model catalogs, usage and subagents; Mono checkpoints and multi-repository commits; literal Git paths and staging preservation; sidebar preferences; image zoom; source-navigation cancellation; and composer autocorrect on the supported platforms. File-navigation fixtures keep mocked file contents stable across watcher IPC calls on slower runners.
+
+### Fixed
+
+- Opening a new session from a full-screen file preview keeps the visible project selected instead of falling back to another project's session. The plus button and new-session shortcut preserve the project's provider defaults and selected worktree. In #896 by @404khai.
+- macOS Finder file-reference URLs resolve to the file's current path, fixing Explorer paste and composer attachments for copied files and images, including files renamed after copying. Both URL parsers reject non-local hosts before resolving a reference. In #635 by @404khai.
+- Mono undo refuses to overwrite later edits, restore across a changed Git `HEAD`, or interfere with an overlapping active session. Checkpoint failures show an error instead of a stale review, and live changes are presented after the turn settles. Windows overlap checks normalize separators and canonical path prefixes while keeping sibling checkouts independent.
+- Selected-file Git actions validate paths against the chosen checkout, reject directory and symlink escapes, and treat filenames literally, including wildcard, colon, and option-like names. Native and remote-host commands use the same selection rules, and repository-discovery failures remain visible.
+- Commit messages remain editable before files are selected or staged.
+- Devin approval responses preserve the selected permission mode instead of escalating a one-time approval to unrestricted access. **Devin's supervised mode accepts file edits automatically and requests command approval**, following the CLI's native behavior; planning denies writes. Cancellation and timeout cleanup reject leftover permission requests, and supervised configuration preserves existing comments and settings. In #748.
+- Devin effort choices follow each model's supported thought levels, and saved model-family selections and unsupported effort values resolve to valid current choices. Background catalog refreshes do not open a sign-in browser, and usage refreshes handle expired credentials and temporary network failures. In #748.
+- Codex discovery prefers the executable resolved by the user's login shell, fixing stale versions and update banners caused by an older fixed-path installation taking precedence. In #878 by @zcy22606.
+- Opening a thought row no longer repeats its first paragraph in both the row header and expanded body. Collapsed rows retain their preview. In #882 by @zcy22606.
+- Tab and project-card reorder drags cancel when a mouse release was missed and the next pointer movement reports no held buttons, preventing a stuck drag. In #879 by @zcy22606.
+- Markdown table columns keep a readable minimum width and top-aligned content; narrow panes scroll horizontally instead of squeezing file names into stacked text. In #876 by @S-loan.
+- Image zoom subscriptions handle setup failures and clean up reliably when previews close or lose their zoom scope.
+- Windows checks handle native temporary-directory paths consistently. Temporary Git-context directories retain private permissions on Unix without introducing a Windows compiler warning.
+
+## [0.10.0] - 2026-10-08
+
+### Added
+
+- Floating Mono chats have a **Mono rail** for switching conversations and creating a new Mono without closing the window. The wider window keeps the rail beside the chat, and its selection stays in sync with the macOS menu bar.
+- Document artifacts open in an animated sheet inside a floating Mono chat, with the same formatted reader and file links as the main window.
+- Settings → Monos → **Menu bar icon** can hide or restore the macOS Mono menu bar icon. The choice survives app restarts.
+- The Explorer file tree supports **keyboard navigation**: arrow keys, Home/End, and PageUp/PageDown move the selection; Right/Left enter, expand, or collapse folders; Enter opens files or toggles folders; and Space activates the selected row. Typing a filename prefix jumps to a match, repeating a letter cycles matches, and focused rows have a visible outline.
+- The Mono's live activity ticker can expand or collapse the current turn's activity directly from the reply header, with keyboard access and an expanded-state indicator.
+- **OpenCode 2.x** servers are supported for local and remote sessions alongside OpenCode 1.x. Version detection selects the matching server, catalog, and event protocol, including approvals, questions, multi-select answers, compaction, cancellation, and resuming a session in its current project folder. In #434 by @puri-adityakumar.
+- The Linux **AppImage updates itself** from Settings → General using signed release downloads. Keep it in a writable directory so it can replace itself and relaunch. `.deb` and `.rpm` installations instead show instructions for updating through apt or dnf; a feed without an AppImage update reports that no update is available. In #825 by @sambhavthakkar.
+- The chat composer enables native **macOS spell checking**, including spelling suggestions in its context menu. Existing macOS spell-checking preferences are preserved. In #829 by @nwoolls.
+
+### Changed
+
+- Mono Codex conversations retain their native context in **isolated MonoCode storage** for the selected account, sharing its provider configuration and credentials. Existing Mono threads migrate with their rollout files, fork dependencies, and delegated-agent state, preserving context across restarts while keeping Mono conversation storage separate from the ordinary Codex session list.
+- Mono provider sessions rotate when reported context reaches **80%** of the model's window. Idle time and app restarts no longer trigger a rotation. A fresh session receives recent exchanges and a bounded brief of earlier work, while the full transcript remains available in the chat.
+- Habits can work for **up to one hour** per run, increased from 15 minutes. Time spent waiting for an approval does not count toward that limit, and overdue runs still stop and record a failure.
+- Active Mono names use compact signature pills beside the work ticker; settled replies use lighter, muted name styling. The floating Mono rail dims when its window loses focus.
+- The macOS Mono menu uses system-style rows, hover feedback, SF Symbols, and red styling for destructive actions.
+- Zen phase live content hides scrollbars while retaining scrolling.
+- Prerelease tags publish to a separate **beta updater feed**, and beta builds use that feed without changing the stable updater feed or macOS download links. AppImage releases are signed after repacking so signatures cover the distributed file. Linux dependency installation bounds APT retries. In #825.
+- Regression coverage now includes real-browser transcript scrolling in Chromium and WebKit, floating-chat navigation and artifacts, file-tree keyboard navigation, long-running habits, remote-tab restoration, Codex storage and temporary-session cleanup, OpenCode 2.x transport, and release-channel isolation. CI checks AppImage packaging for bundled libraries and GTK hooks. Temporary transcript scroll diagnostics and an accidental document-preview mockup were removed. In #818 and #824.
+
+### Fixed
+
+- Scrolling settled chat history keeps the scroll range stable instead of resizing turns during a gesture. Small reversals do not restart following, directionless trackpad events do not snap the reader back, and reopening or reattaching a transcript follows the latest turn without restoring a stale offset. In #818 by @nwoolls.
+- Opening a local project preserves remote sessions instead of reusing their tabs as blank local sessions. Remote tabs are reused only for the matching project, including while their saved transcript is still loading.
+- Files in the Changes list respond across the full row height and open their exact diff path without an unnecessary path-resolution request, reducing selection latency. In #830 by @nwoolls.
+- Opening a provider's model dropdown in Settings explicitly refreshes its catalog even when a live catalog is already cached, so newly available models can appear without restarting.
+- Linux AppImages use the host's **WebKitGTK 4.1 and system libraries**, avoiding EGL display failures caused by bundled Ubuntu libraries on current Mesa systems. Install `libwebkit2gtk-4.1-0` on Debian/Ubuntu, `webkit2gtk4.1` on Fedora, or `webkit2gtk-4.1` on Arch. Native Wayland is supported, and `GDK_BACKEND=x11` remains available when needed. In #824 by @sambhavthakkar.
+- Windows Codex Mono storage creates directory junctions against canonical source paths and opens copied rollout files with write access before flushing, fixing configuration-link creation and file-sync failures.
+- Temporary Grok and OpenCode text-generation sessions are deleted after completion, failure, or cancellation. Generated Codex text uses unsaved threads by default, while side questions retain resumable context. Grok cleanup accepts only valid session UUIDs.
+
+## [0.9.0] - 2026-10-07
+
+### Added
+
+- Monos can create persistent **document artifacts** for reports, plans, and other Markdown deliverables. Document cards appear beneath the originating reply and open a reader with formatting, file links, copy, and delete controls. Documents survive app restarts and the reader refreshes when a document is revised.
+- Monos and habit runs can use `app artifacts.list`, `artifacts.read`, and `artifacts.write` to find, read, create, or revise documents and attach them to the chat or habit report. Retrying a creation request reuses the saved document instead of creating a duplicate. Deleting a document removes its cards from saved conversations, and later saves from another window cannot restore them.
+- On macOS, the **Monos menu bar** lists each Mono with its mascot and opens a resizable floating chat that stays above other windows and follows across Spaces. Floating chats share the main conversation, accept messages and attachments, handle approvals and questions, and offer controls to stop a reply or open the conversation in MonoCode.
+- A Mono's **Details → Permissions** picker saves its permission mode alongside its model settings. New Mono conversations start with **Auto** permissions.
+- Mono replies have a **Sessions** control for work launched during that turn. Its panel shows each session's provider, model, project, and current status, including requests for input, drafts, and archived sessions. Launch records survive chat restoration, so saved sessions remain accessible after their tabs close.
+- Settings → Monos adds a separate sidebar visibility preference for sessions started by each Mono. Hidden sessions remain saved and can be opened from the Mono's chat; the preference applies to newly started sessions.
+- The opt-in `app` CLI adds `sessions.stop`, `sessions.archive`, and `sessions.delete` to manage another regular session in the chosen project. Stop cancels the active turn and pauses queued messages; archive saves the conversation for later restoration; delete permanently removes it. Open files, terminals, and worktrees are kept. `sessions.list` also reports archived status.
+
+### Changed
+
+- Account emails are **masked by default** when no display preference has been saved. Existing choices are preserved, and Settings → Providers → Usage and privacy → **Mask account emails** controls the display.
+- Mono chats keep opening narration and intermediate progress in the activity trail, show live status beneath the Mono's name, and reveal the final answer when work finishes. The activity control sits beside the reply actions, and copying or saving a reply uses its final answer.
+- Automatic Mono replies after delegated sessions finish continue the preceding answer with one header and one set of reply actions. A new day or a break of more than an hour starts a separate message with its own timestamp.
+- Max and Ultra effort animations now apply to every provider whose effort or variant controls expose those options, including keyboard highlighting. In #672 by @shxntanu.
+- Regression coverage now includes document persistence and deletion, floating-chat delivery and motion, Mono permission settings, launched-session history and visibility, session lifecycle actions, and completion-report ordering.
+- Host integration test suites run serially with longer timeouts on every platform, reducing failures and teardown races under load. In #683 by @shxntanu.
+
+### Fixed
+
+- Replies to delivered mid-turn Mono follow-ups appear immediately and stay visible when more tool work arrives. Queued or failed messages are not treated as delivered follow-ups, and replies already shown remain available when background work resumes.
+- Mono completion reports wait for launch acceptance, including sessions that finish before their launch is acknowledged. Rejected launches and follow-ups do not produce a second report. When a Mono stops, archives, or deletes a monitored session, its pending or queued report is dismissed while reports for other sessions and other Monos are retained.
+- Selecting an IME candidate with Enter no longer sends a Mono message or submits the memory fact, Mono name, or new habit name fields prematurely on WebKit. In #790 by @king20300.
+- Codex turns can start before a model has been explicitly selected. The adapter omits the collaboration-mode override until a model is known, allowing Codex to use the thread's selected model without rejecting a null model setting. In #771 by @Slowper.
+- Notes created without a title receive a title-based filename slug when title editing finishes or the editor closes, instead of retaining an `untitled` slug. Later title edits discard stale finalization requests, and existing or user-chosen slugs stay stable. In #788 by @nwoolls.
+- **⌘W / Ctrl+W** closes the active project-dock terminal and **⌘T / Ctrl+T** adds a dock terminal while that dock has keyboard focus. Elsewhere the shortcuts retain their workspace behavior, and macOS New Tab and Close Tab menu actions affect only the focused window. In #774 by @50BytesOfJohn.
+- Settings refreshes live provider model catalogs even when built-in fallback models are already present, fixing stale Pi and Antigravity model lists after restart. In #783 by @rxchitrx; fixes #738.
+
+## [0.8.0] - 2026-10-06
+
+### Added
+
+- **Monos** are persistent agents on the project rail, each with its own conversation and assigned projects. Create and reorder them, choose a name, animated pixel mascot, color, and chat background, and return to the same conversation across app restarts. Monos also appear in the project picker; Settings → Monos can hide them or reset a Mono's name and standing instructions. In #773.
+- A Mono's **Details** panel brings together its provider, model, model settings, and assigned projects, with separate **Soul**, **Memory**, and **Habits** pages. Soul holds editable Markdown standing instructions in `SOUL.md`; the Mono can update them when asked. Resetting a conversation clears its messages while keeping its soul, memory, and habits. In #773.
+- Mono memory carries dated facts and preferences across conversations and provider changes. Add, edit, and forget facts in the Memory page or ask the Mono to manage them; topic notes and an archive keep older detail searchable without loading everything into each turn. Soul and memory files live in the app's data folder, and concurrent edits preserve unsaved drafts and retry against the latest contents instead of overwriting another writer's changes. Common credential formats are redacted from facts saved through the app CLI. In #773.
+- **Habits** run recurring tasks hourly, daily, on weekdays, or weekly in local time while MonoCode is open. Create them in Details or through the Mono, pause or resume them, run them immediately, and inspect their latest 20 outcomes, reports, errors, and durations. Suggested habit cards wait for the user to start them. In #773.
+- Habit runs work in separate background sessions with full tool access, post useful findings to the Mono's chat, and stay quiet when there is nothing to report. Provider approval requests appear in the chat. Runs execute one at a time, are claimed across windows to prevent duplicates, and skip schedules missed by more than two hours; working-time and unanswered-approval limits stop stalled runs. In #773.
+- Monos can use the local `app` CLI to read, start, draft, and message sessions, manage worktrees and folders, and read or write notes across their assigned projects. Delegated sessions start in the background and notify the Mono when they finish; work launched in the same turn returns as one batch, including failures and cancellations, for a consolidated report once the Mono is idle. In #773.
+- The opt-in `app` CLI adds `notes.write` to create notes or update their title, Markdown body, and tags. Created notes retain their source session, and retrying a creation request does not duplicate the note. In #773.
+- Mono chats support live pull request and session cards, clickable reply choices, and habit suggestions through `app chat.card`. Pull request and session cards reflect their current state and open the associated work. Habit reports can include the same cards. In #773.
+- Mono chats accept follow-up messages while an answer is streaming, show them immediately as stable bubbles, and deliver them in order once the provider is ready. Failed sends remain available for retry, saved outboxes retain attachments, quotes populate the draft, and files can be dropped anywhere on the chat. Questions keep the input, draft, and attachments in place. In #773.
+- Mono tool activity folds into a compact work summary with a live status and a separate chronological activity panel. Pending approvals remain actionable, completed reports have response controls, images appear above message bubbles, and emoji-only messages appear enlarged. New messages and chat growth animate with reduced-motion support. In #773.
+- Mono usage-limit notices can resume work manually or at the reset time, switch to another model or provider, or choose another saved account. Recovery preserves the conversation and continues pending work without adding a duplicate continuation. In #773.
+- Long Mono conversations retain their full transcript in storage, load older pages on demand, and support search across archived and live messages while output streams. The provider session refreshes when context grows too large or after a sufficiently long break, carrying recent exchanges and a bounded brief of earlier work without an extra model summarization call. In #773.
+- Codex asynchronous agent questions appear in the shared question panel alongside server requests. Answers steer the active turn, with retry handling if the turn changes during delivery and cleanup when it ends or is canceled.
+
+### Changed
+
+- Visible agent output flushes with animation frames, while background and hidden-window sessions update on a separate, slower cadence. Switching tabs catches up visible panes without forcing hidden streams to repaint; approvals and questions still appear immediately and in order.
+- Worktree file indexes survive tab switches and refresh when resumed instead of rebuilding on every return. Hidden Explorer views retain their state, and sidebar updates avoid work for unchanged sessions.
+- Transcript rendering reuses unchanged turns and panes, reducing repeated processing during streaming. Jump-to-latest visibility updates without rerendering the entire session pane.
+- GitHub Inbox background refreshes run every two minutes while visible and every five minutes while hidden or in the tray, and cached Inbox lists remain fresh for two minutes. Linked session badges reuse those results instead of fetching each historical work item separately, and repeated focus changes respect the polling interval.
+- Pull request checks load when a GitHub PR opens, but ongoing checks polling runs only while its **Checks** tab is visible.
+- Notes and Mono soul editing share the Markdown source editor with syntax highlighting and line numbers.
+- Regression coverage now includes Mono persistence, memory conflicts, transcript paging and search, habit scheduling across windows, message delivery and completion batches, usage recovery, asynchronous questions, native glass, background flushing, file-index reuse, and GitHub polling and backoff.
+
+### Fixed
+
+- Transcript scrolling preserves the reader's position when streaming output, resizes, or observer callbacks arrive before a delayed scroll event. Small upward movements pause following, and following resumes only after reaching the transcript end.
+- Notes autosave keeps empty or spaced title drafts intact while the title field is focused, while continuing to save body edits and non-empty titles. Title normalization waits until blur or editor teardown. In #769; fixes #768.
+- Remote-session polling no longer interrupts IME composition in the composer or causes Enter intended to select a candidate to send the message. In #741 by @king20300.
+- **New Terminal**, **New Terminal Tab**, and the first project-dock terminal open in the active session's worktree even when a pane from another checkout has focus. Removed worktrees are excluded, and sessions without a worktree keep the focused pane's directory behavior. In #732 by @zaesho; fixes #697.
+- Terminal font selection prefers JetBrainsMono Nerd Font Mono and includes common Nerd Font fallbacks, allowing installed prompt icon glyphs to render on WebKit. The terminal font stack survives production CSS generation. In #767.
+- Skill discovery accepts up to 5,000 skills across its roots instead of stopping at 300, making larger personal catalogs available in Settings, filtering, and the composer slash picker. In #750 by @Erickzao; fixes #168.
+- Pi extension status updates replace one row per status key within the current turn instead of appending a row on every update. Empty status text removes the row, and the next turn starts a new one. In #760 by @Erickzao.
+- Pi and omp GitHub Copilot model catalogs exclude internal agent models and legacy GPT-3.5/4 snapshots that Copilot omits from its own picker. In #766.
+- macOS glass tint paints natively during window resizing and stays in sync with the appearance color and opacity. CSS tint remains available when native tint cannot be confirmed, avoiding doubled opacity.
+- Modal panels render above their backdrops, with solid light-theme backgrounds and clearer title styling.
+- The **Open folder on a machine** dialog no longer darkens the entire window, keeping its light-theme panel and surrounding content from turning gray. Clicking outside still cancels it. In #733 by @zaesho.
+- In the editor's diff view, the `+`/`-` marker sits between the line numbers and the code instead of at the far left of the gutter. Changed rows tint their line numbers, removed lines show their old line number, and each changed line has one color cue instead of two bars, matching the unified diff view. The gutter reserves enough space for the original file's line numbers. In #759 by @EricRasputin.
+- The Inbox pull request overview's change counts and per-file bars follow the selected diff color palette instead of fixed red and green. In #759 by @EricRasputin.
+- GitHub reads back off after primary or secondary API rate limits instead of repeatedly retrying. The Inbox keeps its last GitHub snapshot visible during refresh failures while other providers can continue updating, and reads recover after the backoff expires.
+- Switching providers after a usage limit uses the saved transcript recap instead of requesting another response from the exhausted provider. Switching accounts starts a fresh thread for the selected account while preserving the conversation. In #773.
+- Queued messages wait while a worktree is being prepared or has been removed instead of dispatching into an unavailable checkout. In #773.
+- Sessions started through the `app` CLI inherit the source session's worktree only when they target the same project. Explicit worktree selections are validated against the chosen project. In #773.
+
+## [0.7.1] - 2026-10-05
+
+### Added
+
+- The sidebar working-copy switcher can search by branch or path and select a checkout with the arrow keys and Enter. Entering a name with no matches offers to create a worktree from the selected checkout's `HEAD`, then switches to it, with progress and errors shown in the picker.
+- Folder rows in the Changes panel's tree view can stage or unstage all changes beneath that folder, including in remote projects. File and folder mutation actions are disabled while another change is in progress, and affected diffs refresh when it completes.
+- The question panel has a **Back** button to revisit and edit earlier answers before submitting, preserving selected options and free-text responses. In #688.
+- GitHub pull request and issue views in the Inbox have an activity timeline that interleaves comments, reviews, and commits chronologically, groups consecutive commits by author, and lets long comments expand on demand. Linked work item panels add expandable description summaries; pull request panels also list changed files with counts and links to each file's diff.
+- Settings → Appearance → **Diff colors** offers Default, Colorblind (blue/orange) and High contrast (blue/orange with stronger tints and text) palettes. They apply to the diff view, the editor's git gutter, tool-call previews, change counts and added/deleted file status in the file tree and changes panel. In #707 by @EricRasputin.
+- The README includes a contributors badge, a link to the full contributor list, and acknowledgments for contrib.rocks.
+
+### Changed
+
+- Workspace search and new-session actions live in the sidebar header in both expanded and compact layouts.
+- Quick Composer has a dedicated permissions picker beside the model selector, and its project picker is in the composer header.
+- Long title-bar and file-pane tab labels fade at their clipped edge. The fade appears only when text overflows and updates as tabs resize.
+- The session sidebar and transcripts above a docked composer fade at the bottom edge, with extra scroll space so the last session and latest reply can scroll fully into view.
+- Newly created sidebar sessions fade in and push existing rows down; session title updates have a sweep and particle effect. Opening a project or reordering existing sessions does not replay the insertion animation. Both effects respect reduced-motion preferences.
+- New split panes slide in from the edge where they were added, while linked work item panels slide in from the right and reveal their content together. These animations respect reduced-motion preferences.
+- Linked GitHub work items preload when hovering their sidebar links. GitHub Inbox details, discussions, and diffs reuse recent cached results and share in-flight requests, reducing repeat API calls and delays when opening a panel.
+- New agent output reveals at a steady pace from its first chunk, including replies that finish before their first paint. Incoming chunks no longer restart the reveal timing; saved replies and output received in a hidden tab appear immediately when opened.
+- Added and removed lines show a `+`/`-` marker in the diff view and in the editor's git gutter, so they no longer depend on red/green color alone. Diff colors are now theme tokens with separate light-theme values, which also improves the contrast of light-theme gutter line numbers. In #707 by @EricRasputin.
+- Regression coverage now includes worktree search and creation, folder staging, file-drop lifecycle handling, transcript scrolling and output pacing, Inbox timelines and cache freshness, and pane animations. Folder-action tests isolate delayed refreshes to avoid timer races.
+
+### Fixed
+
+- Transcript scrolling keeps the reader's place when earlier turns resize together or composer resizing temporarily changes the viewport. Layout changes and queued scroll events no longer resume paused following, and scrolling inside a code block no longer interrupts transcript following.
+- File and image drops work after the composer becomes ready or switches providers, with correct drop coordinates on Windows and Retina Macs. Sending waits for dropped attachments to finish reading; stale reads after a draft reset or unmount are discarded. Duplicate native/browser drop events attach a file once, browser image items are accepted even without a populated file list, and unreadable or missing files show an error.
+- Staging and unstaging treat file and folder paths literally, so names containing wildcard characters or Git pathspec syntax cannot affect unrelated paths, locally or on a remote host.
+- Markdown and SVG files opened for Git review default to source mode so their changes are visible in the editor. Review tabs remember their view mode separately from ordinary file tabs. In #660.
+- The model search receives focus after its flyout becomes visible, including both the Models submenu and the picker opened beside the current model. In #670 by @SachinD6.
+- The composer model picker keeps long model names on one line instead of truncating them.
+- Explorer file names no longer clip the bottoms of letters such as `g`. In #678 by @sambhavthakkar.
+- Sidebar diff statistics scale to the available width and refit when the sidebar is resized.
+- The provider usage chip, its tooltip, and usage cards update immediately when **Show remaining usage** changes. Remaining percentages are calculated from clamped usage values.
+- Session history shows live title and linked-work-item updates before the next save. Pending agent events are applied before submitting or steering a message, keeping received output before the new user message and checking the latest session state.
+- Pi's model catalog includes models registered by extensions. In #645 by @AdzeB.
+- Remote hosts detect the Pi coding agent installed via npm by resolving its launcher and checking the enclosing package manifest. In #687; fixes #673.
+- Merge request diffs load on older self-hosted GitLab instances by falling back to the legacy changes endpoint when the newer endpoint is unavailable. Permission and connection errors still surface normally, and incomplete diffs are marked as truncated. In #723.
+
+## [0.7.0] - 2026-10-02
+
+### Added
+
+- The sidebar working-copy switcher gives local worktrees their own workspaces, with open-tab counts and activity indicators. Selecting a worktree filters its sessions and tabs; the project-folder session list still shows all project conversations. New sessions start in the selected checkout, and switching workspaces restores a remembered tab, carries over a blank session, or opens a new one.
+- Settings → Providers → Usage and privacy adds **Show remaining usage** and **Mask account emails**. Both preferences stay in sync across windows; enabling masking again hides previously revealed emails. In #592 by @itizarsa.
+
+### Changed
+
+- Usage meters show used capacity and account emails are visible by default, including after upgrading from 0.6.0. Enable **Show remaining usage** and **Mask account emails** to restore the previous display behavior. In #592 by @itizarsa.
+- Tabs belong to the workspace where they were opened. Opening an existing conversation from the session list, search, or inbox brings its tab into the selected workspace while preserving its checkout; changing a session's working copy from the composer keeps the tab in its current workspace.
+- Local projects reopen in their default workspace after an app restart. Only tabs assigned to that workspace are restored; tabs in other worktree workspaces close, while saved conversations remain available in history.
+- Inbox, Notes, and Automations preload after the workspace appears. Navigation keeps the current view visible until the destination is ready, and cached notes and automation lists appear immediately while refreshing.
+- Markdown code highlighting uses a bounded cache and shares concurrent highlighting requests, avoiding the accumulation of every partial code block during streaming. Exact cache keys also prevent different blocks from receiving each other's highlighting. In #636 by @pdparchitect.
+- The Inbox image and video cache has a 32 MiB budget, evicts the least recently used media, and shares downloads already in progress instead of retaining every file for the life of the window. In #638 by @pdparchitect.
+- Codex Max and Ultra effort options have animated tile and glow effects in the model picker and effort menu, with keyboard highlighting and reduced-motion support. Glow edges have been softened. In #516 by @shxntanu.
+- Transcript turn metrics have more spacing beside the other response controls.
+- Session detachment and finished-session tracking now use dedicated hooks, with expanded regression coverage for lifecycle cleanup, cache eviction, concurrent highlighting, terminal remounts, navigation, and UI restoration.
+
+### Fixed
+
+- Rapid worktree selections apply the latest choice and ignore stale completions, keeping the selected workspace aligned with the blank session's execution directory. The switcher shows progress and failures, and the composer is temporarily disabled while a switch is pending.
+- Opening a specific session from search or the inbox after a project switch no longer redirects to an unrelated remembered worktree tab. Project returns keep their existing conversation fallback, including tabs with panes from different projects.
+- Finished orchestration workers and internal inbox discussions no longer remain marked as unseen live agents, allowing eligible finished workers to detach and release their transcripts. In #639 by @pdparchitect.
+- App windows no longer buffer harness output for processes owned by other windows or for stopped process generations, preventing unused output from accumulating or being replayed into a replacement process. In #637 by @pdparchitect.
+- OpenCode closes event-stream handlers when stopping a session even if the stream or server already ended, releasing the retained session state. In #640 by @pdparchitect.
+- A terminal no longer opens blank when its view remounts with the same ID, such as under React StrictMode in development or after moving a terminal between the dock and a file pane. The previous view's late cleanup used to kill the new shell and drop its output listener. In #641 by @king20300.
+- **Open All Changes** respects the section it was opened from: Changes shows unstaged diffs, Staged Changes shows staged diffs, and the staged review is labeled accordingly. In #582 by @itizarsa.
+- Large files with scattered edits use a line-by-line diff instead of appearing entirely changed when the character diff gives up. Hunk staging uses the same diff calculation as the review. In #590 by @itizarsa.
+- Markdown previews, notes, and skill documents preserve line breaks, including around inline formatting, blockquotes, and explicit breaks. Agent replies and inbox comments continue to reflow as prose. In #595 by @sambhavthakkar.
+- Codex command rows show their commands instead of a bare Shell label when a file-listing action has no path. Older rows are repaired from their saved command previews, and a failed repair save no longer prevents opening the conversation. In #581 by @sambhavthakkar.
+- User-message bubbles fit within narrow session panes and recalculate their shape when a pooled transcript is shown again. In #575 by @sambhavthakkar.
+- Closing Settings or navigating back restores the previously open workspace view.
+- **Reveal in File Explorer** selects the correct file on Windows when its path contains spaces. In #619 by @SamuelPoiani.
+- ARM64 Linux builds use the platform's correct character type for the terminal name buffer, fixing a compilation failure. In #584 by @pdparchitect.
+
+## [0.6.0] - 2026-09-30
+
+### Added
+
+- Settings → MCP discovers connections for Claude Code, Claude Desktop, Codex, Cursor, and OpenCode. Filter by provider, select a project, inspect server configuration and status, and add or remove servers in the scopes each provider supports. In #458.
+- `/mcp` opens a server picker in the composer. Selected servers appear as inline tags, tell the agent which configured servers to use, and stay with saved drafts when switching sessions. In #458.
+- MonoCode checks for Claude Code, Codex, OpenCode, and Pi CLI updates once per app launch and offers in-app updates. An update is confirmed against the installed version, and model catalogs refresh across open windows after it succeeds.
+- File → Autosave saves editor changes after one second without typing. It is off by default, respects Format on save, and pauses when an external file change needs a decision. In #475.
+- `/plan` and `/orchestrator` select the turn's mode, while `/draft` saves the message without starting an agent. Mode commands have autocomplete and completion in the main and Quick composers, with inline command styling and removable mode pills in the main composer.
+- Linux supports transparent glass in dark mode through the Body glass preference. It is off by default; turning it off restores an opaque window that follows the selected theme. In #561.
+- A session's sidebar context menu can copy its harness session ID or MonoCode session ID. Harness IDs are retained in session summaries, including repaired summaries from older caches.
+
+### Changed
+
+- Provider usage bars and labels show the percentage remaining rather than the percentage used.
+- Provider account emails are blurred until revealed, including in Settings and the usage and account pickers. Revealing an email is separate from switching accounts.
+- The session sidebar toggle uses a dashboard icon in the title bar.
+- MCP discovery is shared between Settings and the composer and cached per project, avoiding repeated probes when navigating or remounting views. Claude connection health loads asynchronously, and an explicit refresh reloads discovery results.
+- File editor tests enable fake timers before mounting the editor, avoiding autosave timer races during parallel test runs.
+
+### Fixed
+
+- Settings → Appearance → Interface scale uses a menu instead of a slider, so adjusting it no longer rescales the UI mid-gesture. In #559.
+- MonoCode no longer crashes at launch on macOS 12 when registering an empty Window menu; the menu now includes Minimize and Zoom. In #509.
+- Triple-clicking a paragraph or code line in an agent reply selects that block instead of extending the selection to the end of the reply. In #535.
+- Plaintext and untagged code fences receive JavaScript syntax highlighting while keeping their original language labels. In #471.
+- Claude background subagents appear once instead of showing both a placeholder and an Agent tool row for the same task. In #536.
+- Failed subagent tool calls retain their error output across Claude, Codex, ACP, Cursor, OpenCode, and Pi. Folded subagent rows show the failed-step count, and error details are capped at the same limit as top-level tools. In #569.
+- Claude's `TaskCreate` and `TaskUpdate` tools populate the todo panel instead of appearing as subagents. Task status changes, renames, and deletions are applied, and task state survives resumed process and app restarts without mixing different Claude conversations. In #513.
+- MCP discovery and management use the configured provider CLI binary paths and preserve disabled server state.
+- OpenCode 2 global MCP timeout settings are recognized as settings rather than mistaken for legacy server entries. In #580.
+- Glass transitions respect reduced-motion preferences even after glass-specific styles are applied.
+- Creating a remote session keeps its initial creation and update timestamps aligned instead of immediately marking it as updated.
+- Unix remote-host bootstrap scripts use LF line endings even when generated from a Windows checkout.
+- A Windows host started by its scheduled task no longer fails to protect its data directory. `Set-Acl` rewrites the audit list, which needs a privilege the task's limited token does not have; the host now sets only the access rules. In #567.
+- Windows host errors show PowerShell's message instead of the CLIXML progress records that Windows PowerShell writes to a redirected stderr. In #567.
+- A remote host re-probes its model catalog when a provider CLI is updated or the catalog is five minutes old, so new models and settings appear without restarting the host. A new remote session drops settings the host's model does not offer, such as a 1M context on an account without it. In #567.
+
+## [0.5.0] - 2026-09-29
+
+### Added
+
+- Experimental remote access runs persistent agent sessions on Windows, macOS, and Linux machines through SSH. Settings → Connections installs a version-matched host, pairs the desktop, manages the private tunnel, and can reconnect or update the host. Remote projects and their sessions appear in the normal project rail and session views. In #432.
+- Remote sessions support Claude Code, Codex, Cursor, Grok Build, OpenCode, Pi, OMP, fx, Hermes Agent, and Antigravity when installed on the host. The host provides its own model catalog and runs each provider under the remote user's account. In #432 and #539.
+- Remote projects use the normal Explorer, file editor, Go to File, project search, Changes, Git history, branch, and worktree views. File creation and editing, diffs, staging, commits, pushes, and pull request creation operate on the host checkout. In #432.
+- Remote conversations support file and image attachments, saved drafts, Plan mode, and Build from a plan. The release now includes verified host packages for Windows, macOS, and Linux on x64 and arm64. In #432.
+- The Help menu links to the MonoCode website, repository, bug report, and feature request pages.
+
+### Changed
+
+- App startup overlaps workspace loading with optional UI loading. Streaming harness updates are batched, and transcript pools avoid unnecessary rebuilding and session saves.
+- Automation cards have a larger interactive target, a separate enable toggle, and an accessible label.
+- Release publishing waits for host packages before updating the in-app updater feed and can safely resume an interrupted draft release. In #528.
+- Windows integration tests allow more time for PowerShell and cleanup operations and run test files without parallelism.
+
+### Fixed
+
+- Transcript scrolling holds the reader's place when earlier turns resize, does not jump back to the bottom while the reader scrolls up, and clears scroll observer state when turns are removed.
+- Generated Git commit messages can be canceled; canceled or superseded results no longer populate Git dialogs.
+
+## [0.4.3] - 2026-09-28
+
+### Fixed
+
+- Read-only Git checks no longer resolve the login-shell path, which could delay project stats and session saves after a Finder launch. Commits, sync, fetch, and clone still use that path when needed.
+- The hidden project rail suspends its Git-stat listeners and reuses recent stats when reopened.
+- Transcript updates no longer make the composer mascot measure layout on every animation frame.
+- Startup and transcript saves no longer scan or reparse saved sessions for orphaned generated images; deleting a session still removes its referenced image files.
+
+## [0.4.1] - 2026-09-28
+
+### Fixed
+
+- Reopening the project rail with Command/Ctrl+B keeps its project list and scroll position mounted, avoiding repeated Git-stat subscriptions and the delay of rebuilding the rail.
+- The macOS Toggle Sidebar menu command affects only the focused window.
+
+## [0.4.0] - 2026-09-28
+
+### Added
+
+- Operator can create and edit notes with `notes.write`; open Notes views refresh after an update.
+- Operator can list and create project worktrees, start sessions in an existing checkout, and place new sessions in panes to the right or below another session.
+- The project folder picker can open several folders at once, preserving their selection order and activating folders that are already open. In #443.
+- Pasting a screenshot into the main or Quick composer attaches the image. Pasting a file or folder copied in a file manager attaches it to the message, including on Wayland. In #479.
+- Codex-generated images appear in transcripts and persist across restarts, including images produced by subagents and BTW side conversations. Image assets are cleaned up when their messages or sessions are removed. In #399.
+- Settings → Providers and the footer account picker show each Claude and Codex account's readiness and usage. The usage view suggests an account with more headroom when the current one is low or exhausted. In #492.
+- Pi sessions show Anthropic or OpenAI Codex subscription usage when the configured provider supports it. In #431.
+- Fedora and Enterprise Linux 10 users can install a native `.rpm` from GitHub Releases; CI builds and checks the package on Fedora and AlmaLinux. In #362.
+- `Cmd/Ctrl+Shift+C` copies the selected Explorer path. The shortcut also works with non-Latin keyboard layouts and the focused project root. In #404.
+- Completed plan and orchestrator turns have distinct animated celebrations, with their intent preserved in saved transcripts.
+
+### Changed
+
+- Provider usage is cached across Settings and footer views and refreshed on explicit request or appropriate polling intervals, avoiding duplicate CLI probes and unnecessary reloads.
+- Project, session, editor, and transcript searches bound their work and cancel superseded requests. Session search no longer holds the write connection while scanning, and truncated results are indicated in the UI. In #462.
+- Release workflow checkouts no longer persist GitHub credentials.
+
+### Fixed
+
+- Claude sessions keep the full native IDs of versioned models, including models missing from the live catalog, instead of selecting another generation or passing an invalid model name. In #488.
+- The project picker keeps the project name visible when its parent path is long. In #507.
+- `Cmd+K` clears the terminal when App: Search has been disabled or assigned another shortcut. In #491.
+- Git commits launched from Finder or the Dock can find `gpg`, hooks, Git LFS, and credential helpers through the user's shell path. In #484.
+- Codex free-plan monthly usage windows are recognized alongside session and weekly windows.
+
+## [0.3.0] - 2026-09-27
+
+### Added
+
+- Settings → Keybindings can record, disable, and reset custom shortcuts for app, editor, tab, and menu commands. The native macOS and in-app menus show the active shortcuts, and conflicts with existing shortcuts are rejected. In #438.
+- Settings → Providers can use an explicitly chosen Agent CLI binary path for each provider, with version validation and automatic detection when no path is set. In #407.
+- `.jsonc` files receive comment-aware syntax highlighting in the editor and Git diff preview. In #382.
+- Tab title menus can archive or delete all conversations in a tab.
+- The macOS terminal supports Option and Command navigation and deletion shortcuts.
+
+### Changed
+
+- BTW side conversations open in an animated sheet, with improved submission and conversation restoration behavior. In #476.
+- Second opinions can use a different model from the same provider when it is the only enabled provider. The picker excludes the model that produced the original answer and explains when no alternative is available. In #421.
+- The compact sidebar has updated session and file icons and a clearer activity indicator; the compact project picker mascot is smaller.
+- The redundant Changes button has been removed from Explorer.
+- Finished streaming responses discard their temporary word-fade markup after the animation completes.
+
+### Fixed
+
+- Source-control file lists report paths relative to the workspace when the workspace is a subfolder of its Git repository, so nested workspaces no longer mix repository-relative and workspace-relative entries. In #465.
+- Opening a file with CRLF line endings no longer doubles every line in the editor, preview, and diff view. Saving and staging keep the file's original line endings, and staged-only changes under `core.autocrlf` are shown instead of an empty diff. Fixes #411.
+- MonoCode now prefers the Claude binary found by the user's shell, then the inherited PATH, before checking fixed install locations. A transient busy-binary error on Linux is retried. In #448.
+- Claude shell commands are restored in session transcripts, including long command labels.
+- Completed GitHub issues show the correct status icon in the Inbox. In #455.
+- BTW submissions report failures, saved conversations survive edge cases, and OpenCode replies no longer duplicate or reorder streamed text. In #476.
+- A malformed PTY data chunk is skipped without throwing from the terminal listener. In #472.
+- Inline Claude subagents no longer leave a turn busy after reporting back, so captured plans can be built. New plan turns also keep their own plan blocks after an app restart. In #452.
+- The macOS shortcut conflict test now checks the platform's Command modifier instead of Control. In #453.
+
+## [0.2.0] - 2026-09-25
+
+### Added
+
+- **BTW** opens a read-only side conversation on a completed agent response without changing the main thread. Use the response's BTW control or `/btw` in the composer. Side conversations support Claude, Codex, Cursor, Grok, OpenCode, Pi, and omp, retain their threads and model settings, and use the provider that produced the original turn even after a handoff. In #353.
+- `/operator` gives an agent opt-in access to MonoCode in that thread through a local `app` CLI. It can inspect models, start or draft sessions, read and message project sessions, organize folders, and read notes. App access lasts for that thread; `/mono` and `/monocode` remain supported aliases. See [Agent access to MonoCode](README.md#agent-access-to-monocode). In #423.
+- Claude and Codex account controls show the cached account's plan, email, and organization in Settings, the account picker, and the usage popover. Identity refreshes after reconnecting. In #372.
+- A usage-limit notice shows the provider's reset time and countdown, pauses queued messages, and offers manual resume or automatic resume after the limit resets.
+- The macOS Quick composer global shortcut can be changed in Settings → Keybindings. The default remains Command+Shift+Space.
+
+### Changed
+
+- The selected Workspace sidebar tab is remembered separately for each project, including when a project is renamed.
+- BTW controls and turn metrics sit with the transcript's response metadata; their hover and focus styles and the BTW popover spacing have been refined.
+- Source-control diff utilities now cover reusing unchanged items and pruning stale entries, with tests for both behaviors.
+- Composer controls fit better in narrow layouts. In #414 by @sambhavthakkar.
+
+### Fixed
+
+- Resuming an interrupted Codex session preserves its saved model and settings while the model catalog loads, instead of temporarily selecting another provider's model. In #422.
+- Closing the last window quits the app on Linux, as it already does on Windows. In #419 by @sambhavthakkar.
+- Escape handling waits for later keydown listeners, so controls can prevent the window-level Escape action when they handle the key themselves.
+
+## [0.1.56] - 2026-09-24
+
+### Added
+
+- On macOS, Quick composer opens a floating prompt over any app with Command+Shift+Space. Choose a project, provider, model, permissions, and working copy; attach files or capture a screenshot; then press Return to start a session in the background or Command+Return to open it. Enable it in Settings → General. In #398.
+- GitHub pull requests in the Inbox show check results, expandable GitHub Actions jobs and steps, and failure details. Failed checks can be sent individually or together to an agent for repair, with progress and the linked conversation tracked in the pull request. In #364.
+- Single-clicking a file, diff, or search result opens a reusable preview tab. Double-clicking its tab or source item, or editing the file, makes it permanent. Preview state survives workspace restoration. In #385.
+- Settings → Providers can set default providers, models, and picker visibility globally or for a selected project. Project defaults apply when opening or moving a blank session into that project. In #395.
+- Settings → Editor has a **Format on save** toggle for Prettier-supported files; it is enabled by default. Turn it off to save the text as typed, including quote style. In #396.
+- Background effects include **Haze**, available globally and per project with a live preview. In #390.
+- When the project rail is compact, its sidebar opens temporarily as a drawer and closes on Escape, an outside click, or session selection. Project menus are available from the project picker even while the rail is hidden, including by right-click or keyboard. In #389.
+
+### Changed
+
+- The collapsed project rail defaults to icon mode for new settings; the hidden rail remains available.
+- Compact-rail live-agent cards have more bottom spacing, and empty sidebar action groups no longer take up space.
+
+### Fixed
+
+- Non-plan Full Access Codex turns now accept supported MCP elicitation confirmations without an additional approval prompt.
+- Claude tool rows reconcile complete streamed input, keep consecutive assistant messages separate, and show background tasks while Claude yields and later resumes.
+- Codex streamed assistant and reasoning text is deduplicated per item instead of repeating completed content.
+- Pi and omp ignore late tool-progress updates after a tool finishes, so completed cards do not return to a running state. In #391.
+- The terminal dock keeps its last chosen side across projects, restarts, and reloads. In #400.
+- Clicking a file in the activity log opens the path shown in its label; mismatched preview paths no longer show an unrelated diff, and home-relative paths resolve correctly. In #330.
+
+## [0.1.55] - 2026-09-23
+
+### Added
+
+- Jira Cloud joins the Inbox with site, email, and API-token connection settings; issue browsing; descriptions and comment threads; comment posting; and shared project filters. **Ask** and **Start work** include the ticket's description and Jira identifier, and Start work lets you choose a local project. This integration uses API tokens without scopes; scoped tokens and Jira Data Center are not supported. See [Jira setup](https://github.com/hardbeat920/monocode/blob/v0.1.55/docs/jira.md).
+- Jira issues support background activity notifications, project-level mute controls scoped to each Jira site, and **Issue appeared** automation triggers that run in the automation's selected workspace. Project lists follow pagination, connection failures remain isolated from other Inbox providers, and disconnecting clears saved credentials and cached Jira content.
+- Conversations have in-transcript Find with match highlighting, previous/next navigation, and Command/Ctrl+F, F3, and Command/Ctrl+G shortcuts. Global conversation-search results now jump to the matching transcript block.
+- Command/Ctrl+Up and Command/Ctrl+Down switch to the previous or next session inside the focused tab. Sessions already visible elsewhere swap panes instead of mounting twice.
+- The session sidebar can be shown or hidden independently through the title bar, View menu, or Command/Ctrl+Shift+B, with the choice remembered across launches.
+- Background artwork supports Dither, ASCII, Halftone, and Scanlines effects, processed in a worker and cached by image revision and theme. Effects can be selected globally or overridden per project with a live preview. Initial background-effect support in #347 by @404khai.
+- Claude Opus 5.5 sessions have a dedicated animated welcome scene that adapts to the available space around the Composer, alongside the existing Astra welcome screen.
+
+### Changed
+
+- Chat is the default transcript layout; saved choices of chat or full-width layout remain unchanged.
+- Sent prompts rise into the transcript, and the Composer moves into its dock on the first message without changing width. Streaming replies reveal words progressively, while tool steps use paced, masked entrance animations to smooth bursts of updates. Motion respects reduced-motion preferences.
+- Switching sessions preserves recently rendered transcripts and scroll positions, prefetches neighboring sessions, and avoids redundant transcript saves. Deferred cleanup, memoized sidebar cards, and staged initial transcript rendering reduce work during navigation and improve first paint.
+- Sidebar diff statistics use tighter spacing around thousands separators.
+- The project background dialog stays within the viewport with scrollable content and updated effect controls.
+
+### Fixed
+
+- Explorer sorts numbered files and folders naturally, placing names such as `chapter-2` before `chapter-10` while keeping folders first. In #356 by @404khai.
+- Opening a file in its default application validates the path and reports launch failures. File and tab context-menu actions show actionable errors instead of silently failing.
+
+## [0.1.54] - 2026-09-22
+
+### Added
+
+- The latest user message can be recalled, edited, rewound, and resent across Codex, OpenCode, Pi, and omp sessions, with attachments, drafts, and provider state kept consistent through failures. In #261 by @shxntanu.
+- Sessions can be linked to GitHub issues or pull requests from the sidebar. Linked identities persist, and event automations restore their work-item links while refreshing session titles.
+- Markdown files have a shared document preview with collapsible frontmatter plus in-preview Find, match navigation, case, whole-word, and regular-expression filters, highlighting, and keyboard shortcuts.
+- Explorer can optionally show Git-excluded files, resolved through repository ignore rules. In #217 by @kartava.
+- File-editor syntax highlighting now covers C, C++, C#, Java, PHP, SQL, XML, SVG, YAML, Go, Dart, Swift, Kotlin, Ruby, shell, TOML, Scala, Lua, R, Perl, PowerShell, Objective-C, Protocol Buffers, and Dockerfiles. In #348 by @404khai.
+- The Changes tab can pull the tracked current branch, with shared Git-operation progress, success or error feedback, and automatic refresh of changed files and open editors. In #352 by @jonathanlamela.
+- Claude Code catalogs include Claude Opus 5.5 with extended thinking, fast mode, and 1M-context support for Claude Code 2.1.280 and newer. In #355 by @kartava.
+
+### Changed
+
+- Diff addition and deletion counts use thousands separators throughout the project rail, sidebar, editor, file tree, review, and unified diff views.
+
+### Fixed
+
+- Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
+- Pressing Enter in the branch picker selects the highlighted branch while preserving the create-branch action for unmatched searches.
+- Composer drafts survive closing and reopening a session pane. In #336 by @bluzername.
+- Edited-turn resend recovery restores the prior transcript and draft cleanly when a provider rejects or fails the rewind, and accepted rewinds retain the right conversation state.
+- The native macOS Window menu again includes the standard tiling actions such as Fill, Center, and Move & Resize. In #344 by @sensitiky.
+- Generic Claude live-catalog aliases now include the concrete version reported by Claude Code, such as `Opus 5.5 (1M context)`, while retaining the stable alias used to launch sessions. The resolver handles future Claude family and version identifiers without requiring another display-label update.
+
+## [0.1.53] - 2026-09-21
+
+### Added
+
+- The workspace picker can attach a session to an existing worktree from a submenu, instead of only creating a new worktree or staying on the current checkout.
+
+### Fixed
+
+- Add-to-chat from a file-only workspace still opens a split session pane when no session tab is already open, seeding a replacement from the first known session instead of dropping the request. In #325.
+- Renaming a project folder on disk keeps that project's sessions, settings, recents, and terminals attached instead of treating the new path as a different project.
+- Agent markdown, code blocks, and diagrams pick up their intended styles after the frontend source-tree move.
+
+## [0.1.52] - 2026-09-20
+
+### Added
+
+- Automations can run agents on hourly, daily, weekday, or weekly schedules; launch immediately with **Run now**; or react to GitHub, GitLab, Linear, and Azure DevOps Inbox events without keeping the window in the foreground. The new Automations surface includes starter templates, reusable or isolated workspaces, run history, and slash-triggered skill selection in prompts. In #327.
+- Antigravity is available on macOS and Linux as a live ACP provider with its own vector mark, model discovery, file and image attachments, permission requests, access modes, persisted session resume, cancellation and process recovery, and discovery of skills from `~/.gemini/antigravity/skills`. In #314 by @elijah7x.
+- Azure DevOps joins the Inbox with PAT authentication for Azure Boards work items and Azure Repos pull requests, including attention filters, details, threads, comments, reviewers, and textual diffs for cloud and HTTPS on-premises organizations. Azure DevOps work-item and pull-request activity can also trigger automations. In #317 by @jonathanlamela.
+- Composer messages can be saved as persistent session drafts instead of being sent immediately. Drafts survive restarts, appear in session status, can be sent later, and can be removed without changing conversation history.
+- New sessions can choose the current checkout, an existing worktree, or a draft workspace that creates its worktree and a descriptive branch on the first turn. Draft workspaces support branch renaming and expose their checkout identity in the Explorer.
+- The Changes panel can amend the latest local commit when `HEAD` has not been pushed, and resets amend mode when the branch or commit changes. In #324 by @kartava.
+- GitHub issue and pull-request URLs render as interactive work-item chips with hover and keyboard-focus previews for metadata, state, labels, and assignees. An optional authenticated prompt can also star MonoCode through the GitHub CLI.
+- The file editor has a draggable CodeMirror scrollbar with change and diagnostic markers, plus a full-width sticky search toolbar.
+- Files can open as standalone top-bar workspace tabs through a persistent setting, and tab opening and closing can use reduced-motion-aware animations through a separate opt-in setting.
+- The project rail has a persistent compact mode that gives workspace content more room while retaining project navigation and status.
+
+### Changed
+
+- Model controls use consistent reasoning-option behavior across providers, can show model settings as beside-picker pills, open the relevant model list directly, and identify the provider behind every favorite. Effort, service-tier, and fast-mode settings are grouped consistently, with effort icons for Pi and omp thinking levels and a speed icon for service tier. In #323 by @D3nnis72.
+- Orchestrated workers use recoverable worktrees seeded from the lead checkout, apply checkpoints with conflict and symlink safeguards, support retrying stopped workers, and clean up their temporary branches.
+- Automation creation opens directly into the template picker, keeps its filters and templates in one scrolling region, and lets prompt fields grow beyond the default Composer height.
+- Worktree deletion no longer requires typing the worktree name, while commit actions, modal titles and borders, and provider-setting controls use clearer states and lighter styling.
+- Banked Codex reset details appear only when resets are actually available, and project mascots no longer use a separate unavailable-reset state.
+- The frontend source tree is organized by application composition, product feature, provider integration, platform adapter, and shared code instead of the former `chrome`, `surfaces`, and catch-all `lib` directories. In #331.
+- Session removal, resilient boolean preference storage, and repository-backed GitLab and Azure DevOps Inbox fetching now use shared lifecycle and data-access helpers.
+
+### Fixed
+
+- Removing the final session associated with a worktree asks about deletion only when an unused worktree actually exists.
+- Removing a saved draft is serialized with session persistence so reusing a session ID cannot restore the deleted draft.
+- Antigravity ignores malformed configuration updates without losing valid options, fails closed when access-mode changes are rejected, and retires stale or blocked transports so cancelled, forgotten, timed-out, or replaced sessions cannot leak output into a later turn.
+
+## [0.1.51] - 2026-09-18
+
+### Added
+
+- Git worktrees provide independent working copies for parallel sessions. The working-copy picker can create a worktree from a new or existing branch, open another working copy in a new session, and recover sessions whose worktree was removed. Settings → Worktrees lists branch, status, unpublished commits, and associated sessions, with guarded deletion that preserves branches and sessions by default. In #319.
+- Settings → Providers can rename and remove named Claude Code and Codex accounts. Removing an account deletes its stored credentials, stops its running turns, and retains existing conversations with a clear prompt to switch accounts before continuing.
+- The Go to File dialog now doubles as a fuzzy command palette when opened with Command/Ctrl+Shift+P or a leading `>`. Its first action reloads MonoCode, also available with Command/Ctrl+Shift+R, with confirmation before discarding unsaved files. In #296 by @MichaelOgunjimi.
+- User messages can be copied with their attachments or saved directly to Notes, and selected transcript text offers the same Notes action with success and error feedback. Message timestamps remain visible even for prompts that contain only a note, handoff, or second-opinion card. In #291 and #320 by @ognjeeen.
+- Agent question options support full keyboard navigation with Arrow keys, Home, End, number shortcuts, Enter, and Space for both single- and multi-select prompts.
+
+### Changed
+
+- Add-to-chat actions from file-only workspaces open a new session pane and seed its focused Composer with the quoted or plain text, leaving the caret ready at the end.
+
+### Fixed
+
+- Open editors reliably reload after agent edits and external file changes, including updates that race the initial file watch or preserve the previous modification time.
+- Stopping a turn or beginning the next one cancels unresolved approval requests, removes stale approval controls, and marks their unfinished tools as cancelled.
+- Conversations created before named Claude Code and Codex accounts were introduced continue under the default account instead of losing their provider session association.
+- Composer focus follows the visible active session in split layouts instead of being captured by a hidden session.
+
+## [0.1.50] - 2026-09-17
+
+### Added
+
+- Hermes Agent is available as an ACP harness with live model discovery, image and file attachments, permission prompts, in-flight redirects, and persisted session resume. Install Hermes, configure a provider with `hermes model`, and MonoCode will add it to the model picker. In #282.
+- Projects can be organized into persistent, collapsible groups in the project rail, with custom names, colors, and mascots. Projects can be assigned or returned to the ungrouped section from their context menu.
+- On Windows, closing a window can hide it to the system tray so running agents continue; the behavior is enabled by default, configurable in Settings, and paired with tray actions to reopen or fully quit MonoCode. Full quits coordinate every window, count all running turns, ask once, wait for workspace saves, recover from stale confirmations, and abort safely if required persistence fails. In #224 by @goujandev.
+- Claude Code and Codex support multiple named accounts. Add or switch accounts from the usage footer; each project remembers its selection, and existing conversations remain pinned to the account that started them. In #280.
+- OpenCode Go usage appears in the status-bar footer with five-hour, weekly, and monthly limits and reset countdowns. Credential discovery supports environment overrides, JSON and JSONC configuration, and XDG data directories. In #263 by @D3nnis72.
+- The branch picker can create a branch through a dedicated name dialog, with the new branch immediately available for selection.
+- Files can be dragged from the Explorer into the Composer, with a drag preview and the same attachment handling as files added through the picker.
+- Project menus can open a project in a detected external editor on macOS, Windows, and Linux.
+- Binary and image viewers can copy the original file to the macOS clipboard from their toolbar or context menu, with temporary success feedback.
+- GitHub pull-request headers include an action to copy the head branch name. Closes #248 in #273 by @bluzername.
+- Contributors can set `MONOCODE_DEV_APP_NAME` to run a separately named macOS development app without changing the default bundle identity. Invalid names and path traversal are rejected. In #284 by @MichaelOgunjimi.
+
+### Changed
+
+- Workspace and file tabs have more consistent alignment, spacing, active-state highlighting, rounded corners, and cursor behavior, while the terminal dock uses a simpler trailing layout.
+- Changing an OpenCode session's access mode updates its live permissions immediately, and switching to Full Access automatically resolves residual approval prompts.
+- Orchestrated workers use private scratch directories and canonical write-path checks. Paused runs remain inspectable, interrupted work can be retried after resuming, and invalid orchestration proposals are repaired before results are published.
+
+### Fixed
+
+- Pasting or dropping files from Finder into the file tree works reliably on macOS, including safe handling of symlink aliases; drop targeting also accounts for Windows display scaling. In #264 by @kartava.
+- The Composer regains focus after answering a question, finishing an agent turn, or returning to the MonoCode window without stealing focus from another Composer or an open picker. In #292 by @MichaelOgunjimi.
+- Context menus can use their intrinsic height, tab-group menus open on the correct side, light-theme popovers remain opaque, and reorderable tabs use the default cursor.
+- Unix orchestration scratch directories retain restrictive `0700` permissions when their ownership is transferred to the worker.
+
+## [0.1.49] - 2026-09-16
+
+### Added
+
+- Usage controls open detailed Claude and Codex limit views with per-window progress, reset times, and refreshed status. Codex accounts can inspect and redeem banked rate-limit resets with confirmation, while project mascots reflect whether resets are available.
+- The Inbox menu and Inbox view can mark all visible activity as read with persistent state. In #253 by @ognjeeen.
+- GitHub Inbox aggregation discovers work items from both fork and parent repositories and keeps operations and caches scoped to the correct repository.
+- Shift-click selects a range of sidebar sessions, while Command/Ctrl-click adds or removes individual sessions from the selection. In #259 by @ognjeeen.
+- Provider footer controls can launch the official browser sign-in flow for Claude Code, Codex, Cursor, Grok Build, and fx when authentication is required. Submitting while signed out opens the same focused sign-in experience instead of printing the CLI error into the transcript.
+
+### Changed
+
+- Settled turns fold advisor interjections, status rows, and delegated runs into the work trail while keeping errors, interruptions, and failed runs visible. Folded prose is visually quieter and status-only groups use a clearer label. In #237 by @elijah7x.
+- Linked work-item panels remain mounted across workspace-tab switches for instant restoration, and their external-link action now sits in the responsive panel header.
+- The first editor opened beside a conversation is placed to its left, preserving the session on the right.
+- Transparent macOS windows use native visual-effect backing, and stationary glass layers are isolated from modal, popover, and notice animations for more stable compositing.
+- Markdown mode tabs, skill selection, and Orchestrator controls have simpler styling and improved contrast across light and dark themes.
+
+### Fixed
+
+- Orchestration waits wake as soon as a worker requests approval or other input, including when input was already pending, and unavailable approval controls stay hidden.
+- GitHub pull-request actions accept successful commands that produce no stdout and then refresh the pull request state.
+- Inbox alerts are suppressed for activity created by the current user across GitHub, GitLab, and Linear.
+- PowerShell and Windows shell commands preserve quoted and partially quoted arguments, recognize option aliases, and stop wrapper-flag parsing at file scripts. In #233 by @notsapinho.
+- The branch picker focuses its search field after the popover becomes visible. In #246 by @actuallyakshat.
+- The Claude usage footer no longer refreshes or writes credentials owned by Claude Code, avoiding refresh-token rotation races that could force frequent reauthentication.
+
+## [0.1.48] - 2026-09-16
+
+### Added
+
+- Drag a split pane into the title-bar tab strip to detach it as a separate workspace tab. Chat, editor, and terminal panes keep their contents and focus.
+- Configure sounds, desktop banners, and sidebar indicators by category for each project from Settings or the project and Inbox menus. Projects can be muted for one, four, or eight hours, until a custom time, or until manually resumed; bulk controls and persistent mute indicators are included, and muting hides Inbox badges without clearing unread activity. In #242 by @ognjeeen.
+- GitHub pull-request details include confirmed actions to merge, convert between draft and ready, close, and reopen the pull request, then refresh the Inbox with its new state.
+- Title-bar tabs show a teal completion check for an unseen agent response until the tab is viewed, while active runs keep their busy indicator.
+
+### Changed
+
+- Linked GitHub issues and pull requests open in a resizable panel beside their session instead of replacing it with the Inbox. Item identity stays pinned while the details scroll as one view, related threads are omitted from the side-panel layout, and review actions remain visually distinct.
+- The usage footer names the active terminal process in place of the generic terminal label and uses tighter control and icon spacing.
+- Moving a note to another project now uses the same searchable, keyboard-accessible project picker as the sidebar.
+- Selection highlights, structural separators, and primary actions use shared theme-aware styling across the interface, and the application icons have been refreshed.
+- Terminals answer OSC color queries with resolved colors from the active theme, and the project terminal dock no longer applies its own background tint.
+
+### Fixed
+
+- Paragraphs and lists in agent replies have clear, consistent spacing without adding trailing whitespace to the message. Fixes #218 in #239 by @bluzername.
+
+## [0.1.47] - 2026-09-15
+
+### Added
+
+- Settings can now be searched by name or keyword across every page. Results jump directly to the matching row, the navigation is organized into **App**, **Agents**, and **Workspace** groups, and transcript and composer preferences have their own **Chat** page.
+- Drag an inactive workspace tab onto any edge of an open pane to merge its complete layout into that workspace. Files, terminals, split arrangements, and focus move together, while dropping onto a blank session replaces it.
+- Settings → Appearance includes a persistent **Accent color** control with named presets and a custom picker. The chosen color is applied to the composer send button and user-message bubbles with an automatically legible foreground.
+- Model flyouts for handoffs, second opinions, alternate Plan builds, and orchestration assignments open an adjacent effort picker when the hovered model supports reasoning levels, and apply the chosen model and effort together.
+- Windows now delivers native toast notifications for completed turns, input requests, and reminders. Notification clicks restore a minimized window and open the related session, while blocked notifications are reported with a link to Windows Settings. In #220 by @ardevdevts.
+- Inbox issue details show when the issue was created. In #231 by @ognjeeen.
+- Orchestration lead cards show a compact subagent summary with per-task status in a hover or keyboard-focus tooltip, and expand their full controls while active, selected, or busy.
+- The **Working agents** preview remains available in the sidebar when the project rail is collapsed, including project identity, elapsed time, current activity, status, selection, and expandable overflow.
+- The GitHub issue chooser includes a structured feature-request template and again permits blank issues.
+
+### Changed
+
+- OpenCode models are grouped under readable provider names in the model picker, and provider names are included in search.
+- Activating a session now loads that harness's live model catalog immediately instead of waiting for the model picker to open.
+- Codex shell activity unwraps launcher commands and presents file inspection as readable **Read**, **Find**, and **List** steps while preserving the underlying command preview, including in saved transcripts.
+- Project terminal creation and activation controls have moved from the title bar to the usage footer, leaving more room for workspace tabs.
+
+### Fixed
+
+- Paused orchestration runs explain why resumption is unavailable, link to another running session that is blocking the checkout, wait for interrupted work to stop, and keep composer text, attachments, and the selected mode when a submission is rejected.
+- Orchestration scopes accept valid absolute paths by rebasing them to the project root, reject paths outside the project with a clear error, and compare Windows drive, UNC, separator, case, and extended-length path forms consistently.
+- Codex installations managed by Bun are detected when locating the CLI. In #82 by @jagadhis.
+- Expanding an orchestration card no longer shifts its header downward.
+
+## [0.1.46] - 2026-09-14
+
+### Added
+
+- **Agent orchestration v1** lets a lead agent coordinate up to four workers in the same checkout. Choose worker providers and models, review and edit the proposed assignments before starting, and let the lead manage dependencies, review results, request corrections, and redirect supported workers mid-turn. Overlapping write scopes are queued, and worker approvals and questions are routed through the lead. In #228.
+- Orchestration workers are grouped under their lead in the sidebar, with status, model, and expandable details. **View agents** opens their transcripts beside the lead. Run history survives restarts, interrupted work pauses for review, and stopping the lead stops its workers too.
+- Completed agent turns show provider-reported token usage, cache metrics, and output rate in a hover or keyboard-focus preview, with metrics retained in saved conversations.
+- Web links in user messages show compact page-title and favicon previews while preserving the surrounding text. Preview requests validate public destinations and keep fetching outside the webview.
+- Settings → Appearance includes a **Dark-mode lightness** slider and remembers its value independently of light mode.
+- Chat backgrounds have separate opacity controls for empty and active sessions, including project-specific overrides. In #191 by @shxntanu.
+- GitHub pull-request reviews in the Inbox can switch between changed hunks and full-file context. In #189 by @UtkarshRahim.
+- **Close All Tabs** is available from the menu and Command/Ctrl+Shift+W. It closes the active tab's editor files first, then closes the workspace tabs on a subsequent invocation, retaining a blank session and confirming unsaved files and running terminals. In #215 by @kartava.
+- Notes can be moved between projects without changing their order or losing edits during navigation. In #187 by @ognjeeen.
+
+### Changed
+
+- Closed conversations are prefetched on hover or press and retained in a bounded cache for faster reopening, with safeguards against stale loads and duplicate tabs.
+- Inbox cards mount progressively to keep large lists responsive. In #209 by @notsapinho.
+- Reordering tabs and projects uses shared motion settings, with smoother scrolling and consecutive drag gestures. In #206 by @ognjeeen.
+- Sidebar session cards place linked work-item and archive controls together in the footer, show a single provider icon, and retain the default cursor on reorderable items.
+- Linked work-item update notices now sit inside their session pane, make the agent action more prominent, and offer clearer open and dismiss controls.
+
 ### Fixed
 
 - OpenCode falls back to readable local paths for unsupported attachment formats instead of sending provider-rejected file parts, and repairs sessions already stuck on an unsupported file turn. Fixes #211.
+- **Supervised** access explicitly sets Claude Code's permission mode, preventing local default settings from silently switching the session to automatic approvals or bypassed permissions. In #203 by @prkl78.
+- OMP advisor interjections no longer fold away complete answers or break assistant streams. Saved conversations recover interjection boundaries and status-split continuations, while long interjections collapse by default. In #156 by @elijah7x.
+- Continuing a conversation dismisses its due reminder and linked-update notices while preserving future reminders. Linked-activity sounds no longer repeat when the same update remounts.
+- Opening the sidebar project picker focuses its search field reliably. In #226 by @actuallyakshat.
+- Background GitHub CLI and related helper commands no longer flash console windows on Windows. In #221 by @korefs.
+- Nested transcript scrollers keep receiving wheel gestures when the outer transcript reaches an edge, including gestures over SVG icons and containers that scroll on only one axis.
+- Orchestration cleanup releases checkout reservations when a window closes and removes stale run and worker ownership records when conversations are deleted. Worker tabs wait for their lead to open, sidebar controls remain independently keyboard accessible, and completed or stopped runs release the Undo lock.
 
 ## [0.1.45] - 2026-09-13
 
@@ -34,10 +872,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitLab Inbox repository detection no longer flashes console windows when it invokes Git on Windows. In #200.
 - Claude Sonnet 5 appears only with Claude Code 2.1.197 or newer, preventing older CLI versions from receiving an unsupported model argument. In #199 by @nulljosh.
 - Claude model choices resolve consistently between the CLI's short live aliases and MonoCode's full startup model IDs, so relaunching no longer switches a saved session to a different model family.
-
-### Fixed
-
-- **Supervised** access now reaches Claude Code as a permission flag. It was the one mode MonoCode sent nothing for, so the CLI fell back to `permissions.defaultMode` from your settings files, and a session the picker labelled Supervised could run as `auto` or `bypassPermissions` without asking.
 
 ## [0.1.44] - 2026-09-12
 
@@ -747,7 +1581,36 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.1.45...HEAD
+[Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/hardbeat920/monocode/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/hardbeat920/monocode/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/hardbeat920/monocode/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/hardbeat920/monocode/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/hardbeat920/monocode/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/hardbeat920/monocode/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/hardbeat920/monocode/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/hardbeat920/monocode/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/hardbeat920/monocode/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/hardbeat920/monocode/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/hardbeat920/monocode/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/hardbeat920/monocode/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/hardbeat920/monocode/compare/v0.4.3...v0.5.0
+[0.4.3]: https://github.com/hardbeat920/monocode/compare/v0.4.2...v0.4.3
+[0.4.1]: https://github.com/hardbeat920/monocode/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/hardbeat920/monocode/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/hardbeat920/monocode/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/hardbeat920/monocode/compare/v0.1.56...v0.2.0
+[0.1.56]: https://github.com/hardbeat920/monocode/compare/v0.1.55...v0.1.56
+[0.1.55]: https://github.com/hardbeat920/monocode/compare/v0.1.54...v0.1.55
+[0.1.54]: https://github.com/hardbeat920/monocode/compare/v0.1.53...v0.1.54
+[0.1.53]: https://github.com/hardbeat920/monocode/compare/v0.1.52...v0.1.53
+[0.1.52]: https://github.com/hardbeat920/monocode/compare/v0.1.51...v0.1.52
+[0.1.51]: https://github.com/hardbeat920/monocode/compare/v0.1.50...v0.1.51
+[0.1.50]: https://github.com/hardbeat920/monocode/compare/v0.1.49...v0.1.50
+[0.1.49]: https://github.com/hardbeat920/monocode/compare/v0.1.48...v0.1.49
+[0.1.48]: https://github.com/hardbeat920/monocode/compare/v0.1.47...v0.1.48
+[0.1.47]: https://github.com/hardbeat920/monocode/compare/v0.1.46...v0.1.47
+[0.1.46]: https://github.com/hardbeat920/monocode/compare/v0.1.45...v0.1.46
 [0.1.45]: https://github.com/hardbeat920/monocode/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/hardbeat920/monocode/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/hardbeat920/monocode/compare/v0.1.42...v0.1.43

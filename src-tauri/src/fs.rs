@@ -1,18 +1,131 @@
 use std::collections::{HashMap, HashSet};
-use std::io::ErrorKind;
-use std::io::Write;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+use uuid::Uuid;
 
 use crate::dirs_home;
 
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_DOCUMENT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_DATA_BYTES: u64 = MAX_GENERATED_IMAGE_BYTES * 4 / 3 + 4;
+const GENERATED_IMAGE_DIR: &str = "generated-images";
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedImageAsset {
+    path: String,
+    mime_type: String,
+    size: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLocation {
+    path: String,
+    identity: String,
+}
+
+/// Resolve a project by filesystem identity when its directory was renamed.
+///
+/// A rename preserves the directory identity. We only inspect direct siblings
+/// of the missing path, which keeps this bounded and avoids a filesystem watch
+/// or a broad disk search.
+#[tauri::command(async)]
+pub fn resolve_project_location(
+    path: String,
+    identity: Option<String>,
+) -> Result<Option<ProjectLocation>, String> {
+    resolve_project_location_sync(&path, identity.as_deref())
+}
+
+fn resolve_project_location_sync(
+    path: &str,
+    identity: Option<&str>,
+) -> Result<Option<ProjectLocation>, String> {
+    let path = expand_home(path);
+    if path.is_dir() {
+        let identity = directory_identity(&path)?;
+        return Ok(Some(ProjectLocation {
+            path: path_to_js(&path),
+            identity,
+        }));
+    }
+
+    let Some(identity) = identity.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if !candidate.is_dir() {
+            continue;
+        }
+        let Ok(candidate_identity) = directory_identity(&candidate) else {
+            continue;
+        };
+        if candidate_identity == identity {
+            return Ok(Some(ProjectLocation {
+                path: path_to_js(&candidate),
+                identity: candidate_identity,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> Result<String, String> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as _, std::ptr::addr_of_mut!(info))
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok(format!(
+        "windows:{}:{file_index}",
+        info.dwVolumeSerialNumber
+    ))
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,12 +136,405 @@ pub struct DirEntry {
     ignored: bool,
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OmpInterjectionAnchor {
+    id: String,
+    after_assistant_text: String,
+    after_occurrence: usize,
+    after_assistant_text_concat: String,
+    after_concat_occurrence: usize,
+    /// A directly following text-only answer can have been coalesced into the
+    /// parent block by old builds. Require both full texts before splitting it.
+    following_assistant_text: Option<String>,
+    following_assistant_text_concat: Option<String>,
+    text: String,
+    custom_type: String,
+    severity: Option<String>,
+}
+
+/// One active-path assistant message in file order. Both join forms of its
+/// text parts are alternatives for the same message, never two messages.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct OmpAssistantText {
+    text: String,
+    concat: String,
+}
+
+/// Recover displayed OMP custom messages that older MonoCode builds omitted
+/// from their persisted transcript. The provider id is already stored with the
+/// session; matching the original JSONL keeps the repair deterministic instead
+/// of guessing from neighbouring reasoning text.
+#[tauri::command(async)]
+pub fn omp_session_interjections(
+    provider_session_id: String,
+) -> Result<Vec<OmpInterjectionAnchor>, String> {
+    let Some(path) = omp_session_path(&provider_session_id)? else {
+        return Ok(Vec::new());
+    };
+    parse_omp_interjections(&path)
+}
+
+#[tauri::command(async)]
+pub fn omp_active_assistant_texts(
+    provider_session_id: String,
+) -> Result<Vec<OmpAssistantText>, String> {
+    let Some(path) = omp_session_path(&provider_session_id)? else {
+        return Ok(Vec::new());
+    };
+    active_omp_assistant_texts(&path)
+}
+
+/// Recover Bash commands that older UI builds saved as a bare "Shell" row.
+/// Claude's own transcript retains the complete tool input by tool-use id.
+#[tauri::command(async)]
+pub fn claude_shell_commands(
+    app: AppHandle,
+    provider_session_id: String,
+    provider_account_id: Option<String>,
+    tool_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    if provider_session_id.is_empty()
+        || !provider_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Invalid Claude provider session id".into());
+    }
+    if tool_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let config_dir = match provider_account_id.as_deref() {
+        Some(id) if id != "default" => crate::harness::provider_account_path(&app, "claude", id)?,
+        _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            Some(path) => PathBuf::from(path),
+            None => {
+                PathBuf::from(dirs_home().ok_or("Home directory is unavailable")?).join(".claude")
+            }
+        },
+    };
+    let transcript_name = format!("{provider_session_id}.jsonl");
+    let root = config_dir.join("projects");
+    let Some(path) = std::fs::read_dir(root).ok().and_then(|projects| {
+        projects.flatten().find_map(|project| {
+            let candidate = project.path().join(&transcript_name);
+            candidate.is_file().then_some(candidate)
+        })
+    }) else {
+        return Ok(HashMap::new());
+    };
+    claude_shell_commands_from_file(&path, &tool_ids)
+}
+
+fn claude_shell_commands_from_file(
+    path: &Path,
+    tool_ids: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let wanted: HashSet<&str> = tool_ids.iter().map(String::as_str).collect();
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut commands = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = record
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for block in content {
+            let Some(id) = block.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if wanted.contains(id)
+                && block.get("name").and_then(serde_json::Value::as_str) == Some("Bash")
+            {
+                if let Some(command) = block
+                    .pointer("/input/command")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|command| !command.trim().is_empty())
+                {
+                    commands.insert(id.to_owned(), command.to_owned());
+                }
+            }
+        }
+        if commands.len() == wanted.len() {
+            break;
+        }
+    }
+    Ok(commands)
+}
+
+fn omp_session_path(provider_session_id: &str) -> Result<Option<PathBuf>, String> {
+    if provider_session_id.is_empty()
+        || !provider_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Invalid OMP provider session id".into());
+    }
+    let root = dirs_home()
+        .map(PathBuf::from)
+        .ok_or("Home directory is unavailable")?
+        .join(".omp/agent/sessions");
+    Ok(find_omp_session_file(&root, provider_session_id))
+}
+
+fn find_omp_session_file(root: &Path, provider_session_id: &str) -> Option<PathBuf> {
+    let suffix = format!("_{provider_session_id}.jsonl");
+    let projects = std::fs::read_dir(root).ok()?;
+    for project in projects.flatten() {
+        let path = project.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+        {
+            return Some(path);
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate.is_file()
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn omp_message_text(value: &serde_json::Value, separator: &str) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            (part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn read_omp_entries(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut entries = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        entries.push(value);
+    }
+    Ok(entries)
+}
+
+fn omp_active_ids(entries: &[serde_json::Value]) -> HashSet<&str> {
+    let nodes: HashMap<_, _> = entries
+        .iter()
+        .filter_map(|value| value["id"].as_str().map(|id| (id, value)))
+        .collect();
+    let mut active = HashSet::new();
+    let mut cursor = entries.last().and_then(|value| value["id"].as_str());
+    while let Some(id) = cursor {
+        if !active.insert(id) {
+            break;
+        }
+        cursor = nodes.get(id).and_then(|value| value["parentId"].as_str());
+    }
+    active
+}
+
+// Return the ordered sequence, not per-text counts: a status split may only
+// be merged with the message at its own source position.
+fn active_omp_assistant_texts(path: &Path) -> Result<Vec<OmpAssistantText>, String> {
+    let entries = read_omp_entries(path)?;
+    let active = omp_active_ids(&entries);
+    Ok(entries
+        .iter()
+        .filter(|value| {
+            value["type"] == "message"
+                && value["message"]["role"] == "assistant"
+                && value["id"].as_str().is_some_and(|id| active.contains(id))
+        })
+        .map(|value| {
+            let content = &value["message"]["content"];
+            OmpAssistantText {
+                text: omp_message_text(content, "\n"),
+                concat: omp_message_text(content, ""),
+            }
+        })
+        .filter(|message| !message.text.trim().is_empty())
+        .collect())
+}
+
+fn parse_omp_interjections(path: &Path) -> Result<Vec<OmpInterjectionAnchor>, String> {
+    let entries = read_omp_entries(path)?;
+    let nodes: HashMap<_, _> = entries
+        .iter()
+        .filter_map(|value| value["id"].as_str().map(|id| (id, value)))
+        .collect();
+    let active = omp_active_ids(&entries);
+    let mut assistants: HashMap<&str, (String, usize, String, usize)> = HashMap::new();
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    let mut concat_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<OmpInterjectionAnchor> = Vec::new();
+    // Metadata and compaction participate in ancestry, not anchor text.
+    // Keep file order for occurrences and notes, but exclude abandoned branches.
+    for value in &entries {
+        if !value["id"].as_str().is_some_and(|id| active.contains(id)) {
+            continue;
+        }
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("message")
+                if value
+                    .pointer("/message/role")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("assistant") =>
+            {
+                let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let text = omp_message_text(&value["message"]["content"], "\n");
+                let concat_text = omp_message_text(&value["message"]["content"], "");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if let Some(anchor) = out.last_mut() {
+                    let text_only = value["message"]["content"]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().all(|part| part["type"] == "text"));
+                    if text_only
+                        && value.get("parentId").and_then(serde_json::Value::as_str)
+                            == Some(anchor.id.as_str())
+                    {
+                        anchor.following_assistant_text = Some(text.clone());
+                        anchor.following_assistant_text_concat = Some(concat_text.clone());
+                    }
+                }
+                let occurrence = occurrences.entry(text.clone()).or_default();
+                *occurrence += 1;
+                let concat_occurrence = concat_occurrences.entry(concat_text.clone()).or_default();
+                *concat_occurrence += 1;
+                assistants.insert(id, (text, *occurrence, concat_text, *concat_occurrence));
+            }
+            Some("custom_message")
+                if value.get("display").and_then(serde_json::Value::as_bool) == Some(true) =>
+            {
+                let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let Some(parent_id) = value.get("parentId").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let mut ancestor = Some(parent_id);
+                let mut seen = HashSet::new();
+                let mut assistant = None;
+                while let Some(id) = ancestor {
+                    if !active.contains(id) || !seen.insert(id) {
+                        break;
+                    }
+                    if let Some(found) = assistants.get(id) {
+                        assistant = Some(found);
+                        break;
+                    }
+                    let Some(parent) = nodes.get(id) else { break };
+                    if matches!(
+                        parent
+                            .pointer("/message/role")
+                            .and_then(serde_json::Value::as_str),
+                        Some("user" | "assistant")
+                    ) {
+                        break;
+                    }
+                    ancestor = parent["parentId"].as_str();
+                }
+                let Some((after_assistant_text, after_occurrence, concat_text, concat_occurrence)) =
+                    assistant
+                else {
+                    continue;
+                };
+                let custom_type = value
+                    .get("customType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("custom")
+                    .to_owned();
+                let mut severity = None;
+                let mut note_bodies = Vec::new();
+                if custom_type == "advisor" {
+                    for note in value
+                        .pointer("/details/notes")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(body) = note.get("note").and_then(serde_json::Value::as_str) {
+                            note_bodies.push(body);
+                        }
+                        let next = note.get("severity").and_then(serde_json::Value::as_str);
+                        if next == Some("blocker")
+                            || (next == Some("concern") && severity.as_deref() != Some("blocker"))
+                            || (next == Some("nit") && severity.is_none())
+                        {
+                            severity = next.map(str::to_owned);
+                        }
+                    }
+                }
+                let text = if note_bodies.is_empty() {
+                    omp_message_text(&value["content"], "\n")
+                } else {
+                    note_bodies.join("\n\n")
+                };
+                // Tool results, metadata and note chains seal the same preceding
+                // assistant prose. Notes resolving there stack in source order.
+                out.push(OmpInterjectionAnchor {
+                    id: id.to_owned(),
+                    after_assistant_text: after_assistant_text.clone(),
+                    after_occurrence: *after_occurrence,
+                    after_assistant_text_concat: concat_text.clone(),
+                    after_concat_occurrence: *concat_occurrence,
+                    following_assistant_text: None,
+                    following_assistant_text_concat: None,
+                    text,
+                    custom_type,
+                    severity,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 /// Immediate children of `path` (project tree). Folders first, then files.
 #[tauri::command(async)]
 pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    let dir = expand_home(&path);
-    let reader = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let ignore = Ignore::load(&dir);
+    list_dir_sync(&expand_home(&path))
+}
+
+pub(crate) fn list_dir_sync(dir: &Path) -> Result<Vec<DirEntry>, String> {
+    let reader = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
     let mut out = Vec::new();
     for ent in reader {
@@ -44,21 +550,76 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
             .map(|t| t.is_dir() || (t.is_symlink() && path.is_dir()))
             .unwrap_or_else(|_| path.is_dir());
         out.push(DirEntry {
-            ignored: ignore.matches(name),
+            ignored: false,
             name: name.to_string(),
             path: path_to_js(&path),
             is_dir,
         });
     }
 
+    let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+    let ignored = git_ignored_names(dir, &names).unwrap_or_else(|| {
+        let ignore = Ignore::load(dir);
+        names
+            .iter()
+            .filter(|n| ignore.matches(n))
+            .map(|n| n.to_string())
+            .collect()
+    });
+    for entry in &mut out {
+        entry.ignored = entry.name == ".git" || ignored.contains(&entry.name);
+    }
+
     out.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-        })
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| compare_natural_names(&a.name, &b.name))
     });
     Ok(out)
+}
+
+fn compare_natural_names(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let a_start = i;
+            let b_start = j;
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let a_digits = &a[a_start..i];
+            let b_digits = &b[b_start..j];
+            let a_value = a_digits
+                .iter()
+                .position(|digit| *digit != b'0')
+                .map_or(&a_digits[a_digits.len()..], |start| &a_digits[start..]);
+            let b_value = b_digits
+                .iter()
+                .position(|digit| *digit != b'0')
+                .map_or(&b_digits[b_digits.len()..], |start| &b_digits[start..]);
+            let order = a_value
+                .len()
+                .cmp(&b_value.len())
+                .then_with(|| a_value.cmp(b_value));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let order = a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase());
+            if order != Ordering::Equal {
+                return order;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
 }
 
 const MAX_PROJECT_FILES: usize = 20_000;
@@ -76,12 +637,25 @@ pub struct ProjectFile {
 /// index-backed); otherwise a bounded walk that never descends into vendor dirs.
 #[tauri::command]
 pub async fn list_project_files(cwd: String) -> Result<Vec<ProjectFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || list_project_files_sync(&cwd))
+    crate::background_work::read(move || list_project_files_sync(&cwd))
         .await
         .map_err(|e| e.to_string())?
 }
 
 pub(crate) fn list_project_files_sync(cwd: &str) -> Result<Vec<ProjectFile>, String> {
+    list_project_files_sync_cancellable(cwd, None)
+}
+
+/// Same listing, but aborts as soon as `cancel` is set.
+///
+/// Both halves of the enumeration can outlast a cancelled search on their own,
+/// so both take the flag: `git ls-files` and the walk it falls back to. The
+/// walk is the one that can run for minutes, but the listing is the one that
+/// can hold a hundred megabytes, so neither is left uninterruptible.
+pub(crate) fn list_project_files_sync_cancellable(
+    cwd: &str,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<ProjectFile>, String> {
     let root = expand_home(cwd);
     if !root.is_dir() {
         return Err(format!("{}: Not a directory", root.display()));
@@ -89,25 +663,97 @@ pub(crate) fn list_project_files_sync(cwd: &str) -> Result<Vec<ProjectFile>, Str
     if !is_indexable_root(&root) {
         return Ok(Vec::new());
     }
-    if let Some(files) = git_ls_files(&root) {
+    if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Ok(Vec::new());
+    }
+    if let Some(files) = git_ls_files(&root, cancel) {
         return Ok(files);
     }
-    Ok(walk_project_files(&root))
+    // `git_ls_files` returns `None` for "not a git repo", truncation, and
+    // cancel. The first two should walk; cancel must not, or a cancelled
+    // `ls-files` would start enumerating the tree it just avoided.
+    if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Ok(Vec::new());
+    }
+    Ok(walk_project_files(&root, cancel.into()))
 }
 
-fn git_ls_files(root: &Path) -> Option<Vec<ProjectFile>> {
-    let output = git_cmd()
+const CHECK_IGNORE_SOME_MATCHED: i32 = 0;
+const CHECK_IGNORE_NONE_MATCHED: i32 = 1;
+
+fn git_ignored_names(dir: &Path, names: &[&str]) -> Option<HashSet<String>> {
+    if names.is_empty() {
+        return Some(HashSet::new());
+    }
+    let mut child = git_cmd()
         .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-co", "--exclude-standard", "-z"])
-        .output()
+        .arg(dir)
+        .args(["check-ignore", "--stdin", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+
+    let mut input = Vec::with_capacity(names.iter().map(|n| n.len() + 1).sum());
+    for name in names {
+        input.extend_from_slice(name.as_bytes());
+        input.push(0);
+    }
+    let mut stdin = child.stdin.take()?;
+    // Write on a separate thread: a large listing can fill the stdout pipe
+    // while git still waits for stdin, which would deadlock a serial writer.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
+
+    if !matches!(
+        output.status.code(),
+        Some(CHECK_IGNORE_SOME_MATCHED | CHECK_IGNORE_NONE_MATCHED)
+    ) {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+/// Ceiling for one `git ls-files` listing. A 2M-file monorepo emits roughly
+/// 120 MB of NUL-separated paths; past this the walk takes over, which is
+/// bounded by `MAX_PROJECT_FILES` and cancellable.
+const MAX_LS_FILES_BYTES: usize = 8 * 1024 * 1024;
+
+fn git_ls_files(root: &Path, cancel: Option<&AtomicBool>) -> Option<Vec<ProjectFile>> {
+    // Routed through the bounded reader rather than `Command::output()`: this
+    // is the path a cancelled search actually takes, because a repository with
+    // a git index never reaches the walk. `output()` buffers the whole listing
+    // before anything can look at it, so on a large monorepo it held ~100 MB
+    // and ran to completion with no way to interrupt it — the exact cost the
+    // walk's cancel check was added to avoid, one function earlier.
+    let (raw, truncated) = git_output_capped(
+        root,
+        &["ls-files", "-co", "--exclude-standard", "-z"],
+        MAX_LS_FILES_BYTES,
+        cancel,
+    )?;
+    if truncated {
+        // A partial listing would silently hide files from search. Fall back to
+        // the walk, which is bounded by its own budget.
         return None;
     }
 
     let mut files = Vec::new();
-    for rel in output.stdout.split(|b| *b == 0) {
+    for rel in raw.split(|b| *b == 0) {
+        if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+            return Some(Vec::new());
+        }
         if rel.is_empty() {
             continue;
         }
@@ -194,7 +840,7 @@ pub struct GitDiffStats {
 /// plus untracked (gitignore-aware) files counted as additions.
 #[tauri::command]
 pub async fn git_diff_stats(cwd: String) -> Result<GitDiffStats, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_stats_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_stats_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -215,6 +861,7 @@ pub struct GitChangedFile {
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffIndex {
     pub branch: Option<String>,
+    pub head: Option<String>,
     pub files: Vec<GitChangedFile>,
     pub additions: i64,
     pub deletions: i64,
@@ -224,12 +871,13 @@ pub struct GitDiffIndex {
     pub ahead: i64,
     pub behind: i64,
     pub ahead_of_default: i64,
+    pub head_pushed: bool,
 }
 
 /// Changed files in the opened folder, with per-file line counts and status.
 #[tauri::command]
 pub async fn git_diff_index(cwd: String) -> Result<GitDiffIndex, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_index_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_index_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -237,7 +885,7 @@ pub async fn git_diff_index(cwd: String) -> Result<GitDiffIndex, String> {
 /// Changed files and counts without branch/upstream synchronization metadata.
 #[tauri::command]
 pub async fn git_diff_files(cwd: String) -> Result<GitDiffIndex, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_files_for(&expand_home(&cwd)))
+    crate::background_work::read(move || git_diff_files_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
 }
@@ -262,11 +910,9 @@ pub async fn git_file_diff(
     relative: String,
     staged: bool,
 ) -> Result<GitFileDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_file_diff_for(&expand_home(&cwd), &relative, staged)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::background_work::read(move || git_file_diff_for(&expand_home(&cwd), &relative, staged))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 const GIT_HISTORY_DEFAULT: u32 = 200;
@@ -303,7 +949,7 @@ pub struct GitHistory {
 /// branch. Newest first, with parent SHAs for the graph.
 #[tauri::command]
 pub async fn git_history(cwd: String, limit: Option<u32>) -> Result<GitHistory, String> {
-    tauri::async_runtime::spawn_blocking(move || git_history_for(&expand_home(&cwd), limit))
+    crate::background_work::read(move || git_history_for(&expand_home(&cwd), limit))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -311,7 +957,7 @@ pub async fn git_history(cwd: String, limit: Option<u32>) -> Result<GitHistory, 
 /// Files changed in one commit (first parent / root).
 #[tauri::command]
 pub async fn git_commit_files(cwd: String, sha: String) -> Result<Vec<GitChangedFile>, String> {
-    tauri::async_runtime::spawn_blocking(move || git_commit_files_for(&expand_home(&cwd), &sha))
+    crate::background_work::read(move || git_commit_files_for(&expand_home(&cwd), &sha))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -323,7 +969,7 @@ pub async fn git_commit_file_diff(
     sha: String,
     relative: String,
 ) -> Result<GitFileDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::background_work::read(move || {
         git_commit_file_diff_for(&expand_home(&cwd), &sha, &relative)
     })
     .await
@@ -408,18 +1054,69 @@ pub struct GitStagedContext {
     pub patch: String,
 }
 
-/// Staged diff (or unstaged vs HEAD if nothing is staged) for commit text generation.
-#[tauri::command]
-pub async fn git_staged_context(cwd: String) -> Result<GitStagedContext, String> {
-    tauri::async_runtime::spawn_blocking(move || git_staged_context_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileLocation {
+    pub root: String,
+    pub relative: String,
 }
 
-/// Create a commit from the current index.
+/// Locate each file's own checkout, including files whose parents were deleted.
 #[tauri::command]
-pub async fn git_commit(cwd: String, message: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_commit_for(&expand_home(&cwd), &message))
+pub async fn git_locate_files(paths: Vec<String>) -> Result<Vec<Option<GitFileLocation>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| git_locate_file(&expand_home(path)))
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Staged diff (or unstaged vs HEAD if nothing is staged) for commit text generation.
+#[tauri::command]
+pub async fn git_staged_context(
+    cwd: String,
+    paths: Option<Vec<String>>,
+) -> Result<GitStagedContext, String> {
+    tauri::async_runtime::spawn_blocking(move || match paths {
+        Some(paths) => git_selected_context_for(&expand_home(&cwd), &paths),
+        None => git_staged_context_for(&expand_home(&cwd)),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Create a commit from the current index, or rewrite HEAD with it when `amend` is set.
+#[tauri::command]
+pub async fn git_commit(
+    cwd: String,
+    message: String,
+    amend: bool,
+    paths: Option<Vec<String>>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        if let Some(paths) = paths {
+            if amend {
+                return Err("Selected-file commits cannot amend HEAD".into());
+            }
+            git_commit_selected_for(&root, &message, &paths)
+        } else if amend {
+            git_commit_amend_for(&root, &message)
+        } else {
+            git_commit_for(&root, &message)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Full message (subject and body) of the commit at HEAD.
+#[tauri::command]
+pub async fn git_head_message(cwd: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || git_head_message_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -539,6 +1236,8 @@ pub struct GitHubWorkItem {
     pub title: String,
     pub url: String,
     pub state: String,
+    pub state_reason: String,
+    pub created_at: String,
     pub updated_at: String,
     pub labels: Vec<GitHubLabel>,
     pub assignees: Vec<GitHubAssignee>,
@@ -553,6 +1252,16 @@ pub struct GitHubStatus {
     pub installed: bool,
     pub authenticated: bool,
 }
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHubStarStatus {
+    Starred,
+    NotStarred,
+    Unavailable,
+}
+
+const MONOCODE_STAR_ENDPOINT: &str = "/user/starred/hardbeat920/monocode";
 
 /// Whether the GitHub CLI is installed and has an active authenticated account.
 #[tauri::command]
@@ -589,6 +1298,46 @@ fn git_github_status_for() -> GitHubStatus {
     }
 }
 
+/// Whether the active GitHub CLI account has starred the MonoCode repository.
+#[tauri::command]
+pub async fn github_monocode_star_status() -> Result<GitHubStarStatus, String> {
+    tauri::async_runtime::spawn_blocking(github_monocode_star_status_for)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn github_monocode_star_status_for() -> GitHubStarStatus {
+    let result = gh_run(
+        Path::new("."),
+        &["api", "--silent", MONOCODE_STAR_ENDPOINT],
+        true,
+    );
+    github_star_status_from_result(result)
+}
+
+fn github_star_status_from_result(result: Result<String, String>) -> GitHubStarStatus {
+    match result {
+        Ok(_) => GitHubStarStatus::Starred,
+        Err(error) if error.contains("HTTP 404") => GitHubStarStatus::NotStarred,
+        Err(_) => GitHubStarStatus::Unavailable,
+    }
+}
+
+/// Star the MonoCode repository for the active GitHub CLI account.
+#[tauri::command]
+pub async fn github_star_monocode() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        gh_run(
+            Path::new("."),
+            &["api", "--silent", "--method", "PUT", MONOCODE_STAR_ENDPOINT],
+            true,
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// `owner/repo` for the GitHub remote of this working copy, via `gh`.
 #[tauri::command]
 pub async fn git_github_repo(cwd: String) -> Result<String, String> {
@@ -597,10 +1346,19 @@ pub async fn git_github_repo(cwd: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// Open issues or pull requests for the current GitHub remote, via `gh`.
+/// The GitHub remote of this working copy and, when it is a fork, its parent.
+#[tauri::command]
+pub async fn git_github_repositories(cwd: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || git_github_repositories_for(&expand_home(&cwd)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open issues or pull requests for one GitHub repository, via `gh`.
 #[tauri::command]
 pub async fn git_github_work_items(
     cwd: String,
+    repo: String,
     kind: String,
     assigned_to_me: bool,
     state: String,
@@ -610,6 +1368,7 @@ pub async fn git_github_work_items(
     tauri::async_runtime::spawn_blocking(move || {
         git_github_work_items_for(
             &expand_home(&cwd),
+            &repo,
             &kind,
             assigned_to_me,
             &state,
@@ -652,11 +1411,12 @@ pub struct GitHubWorkItemDetails {
 #[tauri::command]
 pub async fn git_github_work_item_details(
     cwd: String,
+    repo: String,
     kind: String,
     number: i64,
 ) -> Result<GitHubWorkItemDetails, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_details_for(&expand_home(&cwd), &kind, number)
+        git_github_work_item_details_for(&expand_home(&cwd), &repo, &kind, number)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -705,11 +1465,12 @@ pub struct GitHubWorkItemThread {
 #[tauri::command]
 pub async fn git_github_work_item_thread(
     cwd: String,
+    repo: String,
     kind: String,
     number: i64,
 ) -> Result<GitHubWorkItemThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_thread_for(&expand_home(&cwd), &kind, number)
+        git_github_work_item_thread_for(&expand_home(&cwd), &repo, &kind, number)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -719,13 +1480,36 @@ pub async fn git_github_work_item_thread(
 #[tauri::command]
 pub async fn git_github_work_item_comment(
     cwd: String,
+    repo: String,
     kind: String,
     number: i64,
     body: String,
     in_reply_to: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_comment_for(&expand_home(&cwd), &kind, number, &body, &in_reply_to)
+        git_github_work_item_comment_for(
+            &expand_home(&cwd),
+            &repo,
+            &kind,
+            number,
+            &body,
+            &in_reply_to,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Merge or change the lifecycle state of a GitHub pull request via `gh`.
+#[tauri::command]
+pub async fn git_github_pr_action(
+    cwd: String,
+    repo: String,
+    number: i64,
+    action: String,
+) -> Result<GitHubWorkItem, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_pr_action_for(&expand_home(&cwd), &repo, number, &action)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -752,11 +1536,190 @@ pub struct GitHubPrDiff {
 const MAX_PR_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
 /// Unified diff and file stats for a pull request, via `gh`.
+/// When `full_context` is true, prefer a large-context `git diff` between the PR OIDs.
 #[tauri::command]
-pub async fn git_github_pr_diff(cwd: String, number: i64) -> Result<GitHubPrDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || git_github_pr_diff_for(&expand_home(&cwd), number))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_github_pr_diff(
+    cwd: String,
+    repo: String,
+    number: i64,
+    full_context: Option<bool>,
+) -> Result<GitHubPrDiff, String> {
+    let full_context = full_context.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_pr_diff_for(&expand_home(&cwd), &repo, number, full_context)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubPrCheck {
+    pub name: String,
+    pub workflow: String,
+    pub state: String,
+    pub url: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubPrChecks {
+    pub head_oid: String,
+    pub checks: Vec<GitHubPrCheck>,
+}
+
+/// CI checks for one pull request, targeted explicitly by `repo` and `number` via `gh`.
+#[tauri::command]
+pub async fn git_github_pr_checks(
+    cwd: String,
+    repo: String,
+    number: i64,
+) -> Result<GitHubPrChecks, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_pr_checks_for(&expand_home(&cwd), &repo, number)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubCheckDetails {
+    steps: Vec<GitHubCheckStep>,
+    annotations: Vec<GitHubCheckAnnotation>,
+    notice: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCheckStep {
+    name: String,
+    state: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct GitHubCheckAnnotation {
+    #[serde(default)]
+    path: String,
+    #[serde(default, rename(deserialize = "start_line"))]
+    line: u64,
+    #[serde(default)]
+    message: String,
+    #[serde(default, rename(deserialize = "annotation_level"))]
+    level: String,
+}
+
+#[tauri::command]
+pub async fn git_github_check_details(
+    cwd: String,
+    repo: String,
+    job_id: String,
+) -> Result<GitHubCheckDetails, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_check_details_with(&repo, &job_id, |endpoint| {
+            gh_checked(
+                &expand_home(&cwd),
+                &["api", "--hostname", "github.com", endpoint],
+            )
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn github_check_details_with(
+    repo: &str,
+    job_id: &str,
+    mut fetch: impl FnMut(&str) -> Result<String, String>,
+) -> Result<GitHubCheckDetails, String> {
+    let (owner, name) = split_github_repo(repo)?;
+    // Only repository slugs and numeric IDs can enter API paths.
+    if [&owner, &name].iter().any(|part| {
+        matches!(part.as_str(), "." | "..")
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    }) || job_id.parse::<u64>().ok().filter(|id| *id > 0).is_none()
+        || !job_id.bytes().all(|c| c.is_ascii_digit())
+    {
+        return Err("Invalid GitHub repository or job ID".into());
+    }
+    #[derive(Deserialize)]
+    struct Step {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        started_at: Option<String>,
+        completed_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Job {
+        id: u64,
+        #[serde(default)]
+        steps: Vec<Step>,
+        check_run_url: Option<String>,
+    }
+    let prefix = format!("repos/{owner}/{name}");
+    let json = fetch(&format!("{prefix}/actions/jobs/{job_id}"))?;
+    let job: Job = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    if job.id.to_string() != job_id {
+        return Err("GitHub returned a different job".into());
+    }
+    let mut details = GitHubCheckDetails {
+        steps: job
+            .steps
+            .into_iter()
+            .map(|step| GitHubCheckStep {
+                name: step.name,
+                state: github_check_state(
+                    &step.status,
+                    step.conclusion.as_deref().unwrap_or_default(),
+                ),
+                started_at: step.started_at,
+                completed_at: step.completed_at,
+            })
+            .collect(),
+        annotations: vec![],
+        notice: None,
+    };
+    let check_prefix = format!("https://api.github.com/{prefix}/check-runs/");
+    let check_id = job
+        .check_run_url
+        .as_deref()
+        .and_then(|value| value.strip_prefix(&check_prefix))
+        .filter(|value| !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()));
+    if let Some(check_id) = check_id {
+        let annotations = fetch(&format!(
+            "{prefix}/check-runs/{check_id}/annotations?per_page=100"
+        ))
+        .and_then(|json| {
+            serde_json::from_str::<Vec<GitHubCheckAnnotation>>(&json)
+                .map_err(|error| error.to_string())
+        });
+        match annotations {
+            Ok(annotations) => {
+                if annotations.len() == 100 {
+                    details.notice = Some(
+                        "Showing the first 100 annotations. View the full log on GitHub for more."
+                            .into(),
+                    );
+                }
+                details.annotations = annotations;
+            }
+            Err(_) => {
+                details.notice =
+                    Some("Could not load error annotations. View the full log on GitHub.".into())
+            }
+        }
+    } else {
+        details.notice =
+            Some("Error annotations are unavailable. View the full log on GitHub.".into());
+    }
+    Ok(details)
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -822,16 +1785,35 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
     let mut files: HashMap<String, FileAcc> = HashMap::new();
     if let Some(text) = git_run(
         root,
-        &["diff", "--no-ext-diff", "--numstat", "HEAD", "--", "."],
+        &[
+            "diff",
+            "-z",
+            "--no-ext-diff",
+            "--numstat",
+            "HEAD",
+            "--",
+            ".",
+        ],
     ) {
         add_numstat_map(&text, &mut files);
     } else {
-        if let Some(text) = git_run(root, &["diff", "--no-ext-diff", "--numstat", "--", "."]) {
+        if let Some(text) = git_run(
+            root,
+            &["diff", "-z", "--no-ext-diff", "--numstat", "--", "."],
+        ) {
             add_numstat_map(&text, &mut files);
         }
         if let Some(text) = git_run(
             root,
-            &["diff", "--no-ext-diff", "--cached", "--numstat", "--", "."],
+            &[
+                "diff",
+                "-z",
+                "--no-ext-diff",
+                "--cached",
+                "--numstat",
+                "--",
+                ".",
+            ],
         ) {
             add_numstat_map(&text, &mut files);
         }
@@ -874,13 +1856,24 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
 
     if let Some(text) = git_run(
         root,
-        &["diff", "--no-ext-diff", "--numstat", "HEAD", "--", "."],
+        &[
+            "diff",
+            "-z",
+            "--relative",
+            "--no-ext-diff",
+            "--numstat",
+            "HEAD",
+            "--",
+            ".",
+        ],
     ) {
         add_numstat_map(&text, &mut files);
         if let Some(names) = git_run(
             root,
             &[
                 "diff",
+                "-z",
+                "--relative",
                 "--no-ext-diff",
                 "--name-status",
                 "--no-renames",
@@ -892,12 +1885,32 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             add_name_status(&names, &mut statuses);
         }
     } else {
-        if let Some(text) = git_run(root, &["diff", "--no-ext-diff", "--numstat", "--", "."]) {
+        if let Some(text) = git_run(
+            root,
+            &[
+                "diff",
+                "-z",
+                "--relative",
+                "--no-ext-diff",
+                "--numstat",
+                "--",
+                ".",
+            ],
+        ) {
             add_numstat_map(&text, &mut files);
         }
         if let Some(text) = git_run(
             root,
-            &["diff", "--no-ext-diff", "--cached", "--numstat", "--", "."],
+            &[
+                "diff",
+                "-z",
+                "--relative",
+                "--no-ext-diff",
+                "--cached",
+                "--numstat",
+                "--",
+                ".",
+            ],
         ) {
             add_numstat_map(&text, &mut files);
         }
@@ -905,6 +1918,8 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
+                "--relative",
                 "--no-ext-diff",
                 "--name-status",
                 "--no-renames",
@@ -918,6 +1933,8 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             root,
             &[
                 "diff",
+                "-z",
+                "--relative",
                 "--no-ext-diff",
                 "--cached",
                 "--name-status",
@@ -966,6 +1983,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
     };
     GitDiffIndex {
         branch: git_branch(root),
+        head: git_stdout(root, &["rev-parse", "HEAD"]),
         files: out,
         additions,
         deletions,
@@ -975,16 +1993,34 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
         ahead: sync.ahead,
         behind: sync.behind,
         ahead_of_default: sync.ahead_of_default,
+        head_pushed: sync.head_pushed,
     }
 }
 
 fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
-    for line in text.lines() {
-        let mut parts = line.splitn(3, '\t');
+    // `git diff -z --numstat` ends each record with NUL. A rename is
+    // `add <TAB> del <TAB> <NUL> old <NUL> new <NUL>`; every other record is
+    // `add <TAB> del <TAB> path <NUL>`. The path itself may contain spaces,
+    // quotes, tabs, or non-ASCII bytes, which a newline listing would C-quote.
+    let mut fields = text.split('\0');
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(3, '\t');
         let Some(add) = parts.next() else { continue };
         let Some(del) = parts.next() else { continue };
         let Some(path) = parts.next() else { continue };
-        let relative = normalize_diff_path(path);
+        let path = if path.is_empty() {
+            let _previous = fields.next();
+            match fields.next() {
+                Some(destination) if !destination.is_empty() => destination,
+                _ => continue,
+            }
+        } else {
+            path
+        };
+        let relative = literal_diff_path(path);
         if relative.is_empty() {
             continue;
         }
@@ -997,9 +2033,14 @@ fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
 }
 
 fn add_name_status(text: &str, statuses: &mut HashMap<String, &'static str>) {
-    for line in text.lines() {
-        let Some((code, rest)) = line.split_once('\t') else {
+    // `--no-renames -z` is `status <NUL> path <NUL>`, repeated.
+    let mut fields = text.split('\0');
+    while let Some(code) = fields.next() {
+        if code.is_empty() {
             continue;
+        }
+        let Some(path) = fields.next() else {
+            break;
         };
         let status = match code.as_bytes().first() {
             Some(b'A') => "added",
@@ -1007,10 +2048,19 @@ fn add_name_status(text: &str, statuses: &mut HashMap<String, &'static str>) {
             Some(b'M' | b'T') => "modified",
             _ => continue,
         };
-        let relative = normalize_diff_path(rest);
+        let relative = literal_diff_path(path);
         if !relative.is_empty() {
             statuses.insert(relative, status);
         }
+    }
+}
+
+fn literal_diff_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        String::new()
+    } else {
+        path_to_js(Path::new(path))
     }
 }
 
@@ -1077,18 +2127,38 @@ fn text_line_count(path: &Path) -> i64 {
 fn mark_cached_and_unstaged(root: &Path, files: &mut HashMap<String, FileAcc>) {
     if let Some(names) = git_run(
         root,
-        &["diff", "--cached", "--name-only", "--no-renames", "--", "."],
+        &[
+            "diff",
+            "-z",
+            "--relative",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "--",
+            ".",
+        ],
     ) {
-        for line in names.lines() {
-            let relative = normalize_diff_path(line);
+        for line in names.split('\0') {
+            let relative = literal_diff_path(line);
             if !relative.is_empty() {
                 files.entry(relative).or_default().staged = true;
             }
         }
     }
-    if let Some(names) = git_run(root, &["diff", "--name-only", "--no-renames", "--", "."]) {
-        for line in names.lines() {
-            let relative = normalize_diff_path(line);
+    if let Some(names) = git_run(
+        root,
+        &[
+            "diff",
+            "-z",
+            "--relative",
+            "--name-only",
+            "--no-renames",
+            "--",
+            ".",
+        ],
+    ) {
+        for line in names.split('\0') {
+            let relative = literal_diff_path(line);
             if !relative.is_empty() {
                 files.entry(relative).or_default().unstaged = true;
             }
@@ -1346,6 +2416,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
         root,
         &[
             "diff-tree",
+            "-z",
             "--no-commit-id",
             "-r",
             "--root",
@@ -1360,6 +2431,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
         root,
         &[
             "diff-tree",
+            "-z",
             "--no-commit-id",
             "-r",
             "--root",
@@ -1446,7 +2518,7 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
 
 fn git_stage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    git_checked(root, &["add", "--", &relative])
+    git_checked(root, &["--literal-pathspecs", "add", "--", &relative])
 }
 
 fn git_stage_contents_for(root: &Path, relative: &str, contents: &[u8]) -> Result<(), String> {
@@ -1521,7 +2593,16 @@ fn git_hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<Strin
 
 fn git_unstage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    git_checked(root, &["restore", "--staged", "--", &relative])
+    git_checked(
+        root,
+        &[
+            "--literal-pathspecs",
+            "restore",
+            "--staged",
+            "--",
+            &relative,
+        ],
+    )
 }
 
 fn git_discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
@@ -1582,12 +2663,224 @@ fn git_staged_context_for(root: &Path) -> Result<GitStagedContext, String> {
     })
 }
 
+fn git_locate_file(path: &Path) -> Result<Option<GitFileLocation>, String> {
+    if !path.is_absolute() || path.as_os_str().to_string_lossy().contains('\0') {
+        return Err("Invalid file path".into());
+    }
+    let mut parent = path.parent().ok_or("Invalid file path")?;
+    while !parent.is_dir() {
+        parent = parent.parent().ok_or("File has no existing parent")?;
+    }
+    // Canonicalize parents rather than the file: deleted files still have a
+    // location, and a tracked symlink belongs to the checkout holding the link.
+    let directory = std::fs::canonicalize(parent).map_err(|e| e.to_string())?;
+    let actual = directory.join(path.strip_prefix(parent).map_err(|e| e.to_string())?);
+    let output = git_cmd()
+        .args(["-C"])
+        .arg(&directory)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        return if error.contains("not a git repository") {
+            Ok(None)
+        } else {
+            Err(error.trim().into())
+        };
+    }
+    let top = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    let top = Path::new(top.trim_end_matches(['\r', '\n']));
+    let repo = std::fs::canonicalize(top).map_err(|e| e.to_string())?;
+    let relative = actual.strip_prefix(&repo).map_err(|e| e.to_string())?;
+    Ok(Some(GitFileLocation {
+        // Git supplies a usable Windows path without canonicalize's verbatim prefix.
+        root: path_to_js(top),
+        relative: path_to_js(relative),
+    }))
+}
+
+/// A selection names literal files in exactly one checkout, never a directory
+/// or a pathspec that can widen the commit to other files or repositories.
+fn git_selected_paths(root: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("Select at least one file".into());
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let mut selected = Vec::new();
+    for path in paths {
+        let relative = path_to_js(Path::new(path));
+        if relative.contains('\0')
+            || Path::new(&relative).is_absolute()
+            || Path::new(&relative)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || relative.split('/').any(|part| {
+                part.is_empty() || matches!(part, "." | "..") || part.eq_ignore_ascii_case(".git")
+            })
+        {
+            return Err("Invalid selected file path".into());
+        }
+        let target = canonical_root.join(&relative);
+        let exists = match std::fs::symlink_metadata(&target) {
+            Ok(entry) if entry.is_dir() => {
+                return Err("Select files rather than directories".into())
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => return Err(error.to_string()),
+        };
+        let location = git_locate_file(&canonical_root.join(&relative))?
+            .ok_or("Selected file is outside Git")?;
+        if std::fs::canonicalize(&location.root).map_err(|e| e.to_string())? != canonical_root {
+            return Err("Selected files must belong to this repository".into());
+        }
+        let tracked = git_output(
+            root,
+            &["--literal-pathspecs", "ls-files", "-z", "--", &relative],
+        )
+        .ok_or("Could not validate selected files")?;
+        if tracked
+            .split(|byte| *byte == 0)
+            .any(|entry| !entry.is_empty() && entry != relative.as_bytes())
+        {
+            return Err("Select files rather than directories".into());
+        }
+        let head_type = git_stdout(root, &["cat-file", "-t", &format!("HEAD:{relative}")]);
+        if head_type.as_deref() == Some("tree") {
+            return Err("Select files rather than directories".into());
+        }
+        if !exists && tracked.is_empty() && head_type.as_deref() != Some("blob") {
+            return Err("Selected file does not exist in this repository".into());
+        }
+        if !selected.contains(&relative) {
+            selected.push(relative);
+        }
+    }
+    Ok(selected)
+}
+
+fn git_commit_selected_for(root: &Path, message: &str, paths: &[String]) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("Commit message cannot be empty".into());
+    }
+    let paths = git_selected_paths(root, paths)?;
+    let existing: Vec<&str> = paths
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(root.join(path)).is_ok())
+        .map(String::as_str)
+        .collect();
+    let mut add = vec!["--literal-pathspecs", "add", "-A", "--"];
+    add.extend(existing);
+    if add.len() > 4 {
+        git_checked(root, &add)?;
+    }
+    // --only takes the chosen working-tree files and preserves every other
+    // staged entry. Add existing files to make new files eligible for --only;
+    // already-staged deletions no longer match `git add` but do match `commit`.
+    let mut args = vec![
+        "--literal-pathspecs",
+        "commit",
+        "--only",
+        "--cleanup=strip",
+        "-m",
+        message.trim(),
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    git_checked(root, &args).map_err(with_signing_hint)
+}
+
+struct GitSelectionIndex(PathBuf);
+
+impl Drop for GitSelectionIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn git_selected_context_for(root: &Path, paths: &[String]) -> Result<GitStagedContext, String> {
+    let paths = git_selected_paths(root, paths)?;
+    let index_dir = std::env::temp_dir().join(format!("monocode-git-selection-{}", Uuid::new_v4()));
+    let directory = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let directory = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut directory = directory;
+        directory.mode(0o700);
+        directory
+    };
+    directory.create(&index_dir).map_err(|e| e.to_string())?;
+    let index = GitSelectionIndex(index_dir);
+    let run = |args: &[&str]| -> Result<String, String> {
+        let output = git_cmd()
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_INDEX_FILE", index.0.join("index"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("PATH", crate::harness::gui_search_path())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+        }
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    };
+    if git_stdout(root, &["rev-parse", "--verify", "HEAD"]).is_some() {
+        run(&["read-tree", "HEAD"])?;
+    } else {
+        run(&["read-tree", "--empty"])?;
+    }
+    let mut add = vec!["add", "-A", "--"];
+    add.extend(paths.iter().map(String::as_str));
+    run(&add)?;
+    Ok(GitStagedContext {
+        branch: git_branch(root),
+        summary: run(&["diff", "--cached", "--stat", "--no-renames"])?,
+        patch: run(&[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+        ])?,
+    })
+}
+
 fn git_commit_for(root: &Path, message: &str) -> Result<(), String> {
+    git_commit_args(root, message, &[])
+}
+
+fn git_commit_amend_for(root: &Path, message: &str) -> Result<(), String> {
+    git_commit_args(root, message, &["--amend"])
+}
+
+fn git_commit_args(root: &Path, message: &str, extra: &[&str]) -> Result<(), String> {
     let message = message.trim();
     if message.is_empty() {
         return Err("Commit message cannot be empty".into());
     }
-    git_checked(root, &["commit", "--cleanup=strip", "-m", message])
+    let mut args = vec!["commit"];
+    args.extend_from_slice(extra);
+    args.extend(["--cleanup=strip", "-m", message]);
+    git_checked(root, &args).map_err(with_signing_hint)
+}
+
+/// Explain why signing fails here when the same commit works in a terminal.
+fn with_signing_hint(error: String) -> String {
+    if !error.contains("failed to sign") && !error.contains("ssh-keygen") {
+        return error;
+    }
+    format!(
+        "{error}\n\nGit couldn't sign this commit. MonoCode runs git without a terminal, \
+         so your signer needs a GUI passphrase prompt (e.g. pinentry-mac) or an unlocked agent."
+    )
+}
+
+fn git_head_message_for(root: &Path) -> Result<String, String> {
+    git_stdout(root, &["log", "-1", "--pretty=%B"]).ok_or_else(|| "No commits yet".to_string())
 }
 
 fn git_push_for(root: &Path) -> Result<(), String> {
@@ -1600,7 +2893,7 @@ fn git_push_for(root: &Path) -> Result<(), String> {
 
 fn git_sync_changes_for(root: &Path) -> Result<(), String> {
     if git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_some() {
-        git_checked(root, &["pull", "--no-edit", "--ff"])?;
+        git_checked(root, &["pull", "--no-edit", "--ff"]).map_err(with_signing_hint)?;
         return git_checked(root, &["push"]);
     }
     git_push_for(root)
@@ -1678,8 +2971,46 @@ fn git_github_repo_for(root: &Path) -> Result<String, String> {
     Ok(slug.to_string())
 }
 
+fn git_github_repositories_for(root: &Path) -> Result<Vec<String>, String> {
+    let json = gh_checked(root, &["repo", "view", "--json", "nameWithOwner,parent"])?;
+    parse_github_repositories(&json)
+}
+
+fn parse_github_repositories(json: &str) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct Owner {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct Parent {
+        name: String,
+        owner: Owner,
+    }
+    #[derive(Deserialize)]
+    struct View {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+        #[serde(default)]
+        parent: Option<Parent>,
+    }
+
+    let view: View = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let (owner, name) = split_github_repo(&view.name_with_owner)?;
+    let mut repos = vec![format!("{owner}/{name}")];
+    if let Some(parent) = view.parent {
+        let parent = format!("{}/{}", parent.owner.login, parent.name);
+        let (owner, name) = split_github_repo(&parent)?;
+        let parent = format!("{owner}/{name}");
+        if !repos[0].eq_ignore_ascii_case(&parent) {
+            repos.push(parent);
+        }
+    }
+    Ok(repos)
+}
+
 fn git_github_work_items_for(
     root: &Path,
+    repo: &str,
     kind: &str,
     assigned_to_me: bool,
     state: &str,
@@ -1690,6 +3021,8 @@ fn git_github_work_items_for(
     if kind != "issue" && kind != "pr" {
         return Err("Unknown GitHub task kind".into());
     }
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
     let state = if state.trim().eq_ignore_ascii_case("all") {
         "all"
     } else {
@@ -1697,9 +3030,9 @@ fn git_github_work_items_for(
     };
     let limit = limit.clamp(1, 100).to_string();
     let fields = if kind == "pr" {
-        "number,title,url,state,updatedAt,labels,assignees,isDraft"
+        "number,title,url,state,createdAt,updatedAt,labels,assignees,isDraft"
     } else {
-        "number,title,url,state,updatedAt,labels,assignees"
+        "number,title,url,state,stateReason,createdAt,updatedAt,labels,assignees"
     };
     let mut args = vec![
         kind.to_string(),
@@ -1708,6 +3041,8 @@ fn git_github_work_items_for(
         state.into(),
         "--limit".into(),
         limit,
+        "--repo".into(),
+        repo.clone(),
         "--json".into(),
         fields.into(),
     ];
@@ -1722,7 +3057,6 @@ fn git_github_work_items_for(
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let json = gh_checked(root, &refs)?;
-    let repo = git_github_repo_for(root).unwrap_or_default();
     parse_github_work_items(&json, kind, &repo)
 }
 
@@ -1743,9 +3077,9 @@ fn git_github_work_item_for(
     let repo = format!("{owner}/{name}");
     let number = number.to_string();
     let fields = if kind == "pr" {
-        "number,title,url,state,updatedAt,labels,assignees,isDraft"
+        "number,title,url,state,createdAt,updatedAt,labels,assignees,isDraft"
     } else {
-        "number,title,url,state,updatedAt,labels,assignees"
+        "number,title,url,state,stateReason,createdAt,updatedAt,labels,assignees"
     };
     let json = gh_checked(
         root,
@@ -1754,8 +3088,43 @@ fn git_github_work_item_for(
     parse_github_work_item(&json, kind, &repo)
 }
 
+fn github_pr_action_args(repo: &str, number: i64, action: &str) -> Result<Vec<String>, String> {
+    if number <= 0 {
+        return Err("GitHub pull request number must be positive".into());
+    }
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
+    let number = number.to_string();
+    let args = match action.trim() {
+        "merge" => vec!["pr", "merge", &number, "--repo", &repo, "--merge"],
+        "squash" => vec!["pr", "merge", &number, "--repo", &repo, "--squash"],
+        "rebase" => vec!["pr", "merge", &number, "--repo", &repo, "--rebase"],
+        "draft" => vec!["pr", "ready", &number, "--repo", &repo, "--undo"],
+        "ready" => vec!["pr", "ready", &number, "--repo", &repo],
+        "close" => vec!["pr", "close", &number, "--repo", &repo],
+        "reopen" => vec!["pr", "reopen", &number, "--repo", &repo],
+        _ => return Err("Unknown GitHub pull request action".into()),
+    };
+    Ok(args.into_iter().map(str::to_string).collect())
+}
+
+fn git_github_pr_action_for(
+    root: &Path,
+    repo: &str,
+    number: i64,
+    action: &str,
+) -> Result<GitHubWorkItem, String> {
+    let args = github_pr_action_args(repo, number, action)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Successful mutation commands do not always write to stdout. Their exit
+    // status confirms the action ran; the follow-up view fetches the new state.
+    gh_run(root, &refs, true)?;
+    git_github_work_item_for(root, repo, "pr", number)
+}
+
 fn git_github_work_item_details_for(
     root: &Path,
+    repo: &str,
     kind: &str,
     number: i64,
 ) -> Result<GitHubWorkItemDetails, String> {
@@ -1763,13 +3132,21 @@ fn git_github_work_item_details_for(
     if kind != "issue" && kind != "pr" {
         return Err("Unknown GitHub task kind".into());
     }
+    if number <= 0 {
+        return Err("Invalid GitHub item number".into());
+    }
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
     let number = number.to_string();
     let fields = if kind == "pr" {
         "body,author,baseRefName,headRefName,reviewDecision"
     } else {
         "body,author"
     };
-    let json = gh_checked(root, &[kind, "view", &number, "--json", fields])?;
+    let json = gh_checked(
+        root,
+        &[kind, "view", &number, "--repo", &repo, "--json", fields],
+    )?;
     parse_github_work_item_details(&json)
 }
 
@@ -1910,6 +3287,7 @@ mutation InboxReviewReply($threadId: ID!, $body: String!) {
 
 fn git_github_work_item_thread_for(
     root: &Path,
+    repo: &str,
     kind: &str,
     number: i64,
 ) -> Result<GitHubWorkItemThread, String> {
@@ -1920,8 +3298,7 @@ fn git_github_work_item_thread_for(
     if number <= 0 {
         return Err("Invalid GitHub item number".into());
     }
-    let repo = git_github_repo_for(root)?;
-    let (owner, name) = split_github_repo(&repo)?;
+    let (owner, name) = split_github_repo(repo)?;
     let query = if kind == "pr" {
         GITHUB_PR_THREAD_QUERY
     } else {
@@ -1969,19 +3346,33 @@ fn github_comment_input<'a>(
 
 fn git_github_work_item_comment_for(
     root: &Path,
+    repo: &str,
     kind: &str,
     number: i64,
     body: &str,
     in_reply_to: &str,
 ) -> Result<String, String> {
     let (kind, body) = github_comment_input(kind, number, body)?;
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
     let reply = in_reply_to.trim();
     if !reply.is_empty() {
         return git_github_review_reply_for(root, reply, body);
     }
     let number = number.to_string();
     with_temp_markdown(body, |path| {
-        let output = gh_checked(root, &[kind, "comment", &number, "--body-file", path])?;
+        let output = gh_checked(
+            root,
+            &[
+                kind,
+                "comment",
+                &number,
+                "--repo",
+                &repo,
+                "--body-file",
+                path,
+            ],
+        )?;
         github_url_from_output(&output, "GitHub did not return a comment URL")
     })
 }
@@ -2473,19 +3864,41 @@ fn github_avatar_url(login: &str) -> String {
     format!("https://avatars.githubusercontent.com/{encoded}?s=64")
 }
 
-fn git_github_pr_diff_for(root: &Path, number: i64) -> Result<GitHubPrDiff, String> {
+const PR_FULL_CONTEXT_LINES: &str = "999999";
+
+fn git_github_pr_diff_for(
+    root: &Path,
+    repo: &str,
+    number: i64,
+    full_context: bool,
+) -> Result<GitHubPrDiff, String> {
     if number <= 0 {
         return Err("Invalid pull request number".into());
     }
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
     let number = number.to_string();
+    let fields = if full_context {
+        "files,additions,deletions,baseRefOid,headRefOid"
+    } else {
+        "files,additions,deletions"
+    };
     let json = gh_run(
         root,
-        &["pr", "view", &number, "--json", "files,additions,deletions"],
+        &["pr", "view", &number, "--repo", &repo, "--json", fields],
         false,
     )?;
     let mut diff = parse_github_pr_diff_meta(&json)?;
-    let patch = gh_run(root, &["pr", "diff", &number], true)?;
-    if patch.len() > MAX_PR_DIFF_BYTES {
+    let (patch, truncated) = if full_context {
+        let (base, head) = parse_github_pr_oids(&json)?;
+        git_diff_full_context(root, &base, &head)?
+    } else {
+        (
+            gh_run(root, &["pr", "diff", &number, "--repo", &repo], true)?,
+            false,
+        )
+    };
+    if truncated || patch.len() > MAX_PR_DIFF_BYTES {
         diff.truncated = true;
     } else {
         diff.patch = patch;
@@ -2495,6 +3908,288 @@ fn git_github_pr_diff_for(root: &Path, number: i64) -> Result<GitHubPrDiff, Stri
         diff.deletions = diff.files.iter().map(|file| file.deletions).sum();
     }
     Ok(diff)
+}
+
+fn parse_github_pr_oids(json: &str) -> Result<(String, String), String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        base_ref_oid: String,
+        head_ref_oid: String,
+    }
+    let row: Row = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let base = row.base_ref_oid.trim();
+    let head = row.head_ref_oid.trim();
+    if base.is_empty() || head.is_empty() {
+        return Err("Pull request is missing base or head commit".into());
+    }
+    Ok((base.to_string(), head.to_string()))
+}
+
+fn git_github_pr_checks_for(
+    root: &Path,
+    repo: &str,
+    number: i64,
+) -> Result<GitHubPrChecks, String> {
+    let args = github_pr_checks_args(repo, number)?;
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = gh_checked(root, &refs)?;
+    parse_github_pr_checks(&json)
+}
+
+fn github_pr_checks_args(repo: &str, number: i64) -> Result<Vec<String>, String> {
+    if number <= 0 {
+        return Err("GitHub pull request number must be positive".into());
+    }
+    let (owner, name) = split_github_repo(repo)?;
+    let repo = format!("{owner}/{name}");
+    let number = number.to_string();
+    Ok(vec![
+        "pr".into(),
+        "view".into(),
+        number,
+        "--repo".into(),
+        repo,
+        "--json".into(),
+        "headRefOid,statusCheckRollup".into(),
+    ])
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubStatusCheckRow {
+    #[serde(default, rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    workflow_name: String,
+    #[serde(default)]
+    details_url: Option<String>,
+    #[serde(default)]
+    target_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+}
+
+fn parse_github_pr_checks(json: &str) -> Result<GitHubPrChecks, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        #[serde(default)]
+        head_ref_oid: String,
+        #[serde(default)]
+        status_check_rollup: Option<Vec<GitHubStatusCheckRow>>,
+    }
+    let row: Row = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let head_oid = row.head_ref_oid.trim().to_string();
+    if head_oid.is_empty() {
+        return Err("Pull request is missing head commit".into());
+    }
+    Ok(GitHubPrChecks {
+        head_oid,
+        checks: row
+            .status_check_rollup
+            .unwrap_or_default()
+            .into_iter()
+            .map(github_pr_check_from_row)
+            .collect(),
+    })
+}
+
+fn github_pr_check_from_row(row: GitHubStatusCheckRow) -> GitHubPrCheck {
+    let is_status_context = if row.typename.is_empty() {
+        !row.context.is_empty()
+    } else {
+        row.typename.eq_ignore_ascii_case("StatusContext")
+    };
+    if is_status_context {
+        return GitHubPrCheck {
+            name: row.context,
+            workflow: String::new(),
+            state: github_check_conclusion_state(&row.state),
+            url: row.target_url.filter(|url| !url.trim().is_empty()),
+            started_at: row.created_at,
+            completed_at: None,
+        };
+    }
+    GitHubPrCheck {
+        name: row.name,
+        workflow: row.workflow_name,
+        state: github_check_state(&row.status, row.conclusion.as_deref().unwrap_or_default()),
+        url: row.details_url.filter(|url| !url.trim().is_empty()),
+        started_at: row.started_at,
+        completed_at: row.completed_at,
+    }
+}
+
+/// An unfinished CheckRun reports its execution state instead of a stale
+/// conclusion. Only a completed or entirely missing status trusts the
+/// conclusion; any other nonempty status stays unknown.
+fn github_check_state(status: &str, conclusion: &str) -> String {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "QUEUED" | "IN_PROGRESS" | "PENDING" | "WAITING" | "REQUESTED" => {
+            return "pending".into();
+        }
+        "COMPLETED" | "" => return github_check_conclusion_state(conclusion),
+        _ => {}
+    }
+    "unknown".into()
+}
+
+fn github_check_conclusion_state(value: &str) -> String {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "SUCCESS" => "pass".into(),
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => "fail".into(),
+        "QUEUED" | "IN_PROGRESS" | "PENDING" | "WAITING" | "REQUESTED" => "pending".into(),
+        "NEUTRAL" | "SKIPPED" => "skipping".into(),
+        "CANCELLED" => "cancel".into(),
+        _ => "unknown".into(),
+    }
+}
+
+fn git_diff_full_context(root: &Path, base: &str, head: &str) -> Result<(String, bool), String> {
+    ensure_git_commit(root, base)?;
+    ensure_git_commit(root, head)?;
+    ensure_merge_base(root, base, head)?;
+    let context = format!("-U{PR_FULL_CONTEXT_LINES}");
+    let three_dot = format!("{base}...{head}");
+    let (bytes, truncated) = git_output_capped(
+        root,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &context,
+            &three_dot,
+        ],
+        MAX_PR_DIFF_BYTES,
+        None,
+    )
+    .ok_or_else(|| format!("git diff failed for {base}...{head}"))?;
+    if truncated {
+        return Ok((String::new(), true));
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), false))
+}
+
+fn ensure_merge_base(root: &Path, base: &str, head: &str) -> Result<(), String> {
+    if merge_base_exists(root, base, head) {
+        return Ok(());
+    }
+    if let Some(remote) = github_fetch_remote(root) {
+        for deepen in ["50", "200", "800"] {
+            let _ = git_output(root, &["fetch", "--no-tags", "--deepen", deepen, &remote]);
+            if merge_base_exists(root, base, head) {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "Cannot find a merge base for {base} and {head}. Fetch more history and try again."
+    ))
+}
+
+fn merge_base_exists(root: &Path, base: &str, head: &str) -> bool {
+    git_output(root, &["merge-base", base, head]).is_some()
+}
+
+fn ensure_git_commit(root: &Path, oid: &str) -> Result<(), String> {
+    let spec = format!("{oid}^{{commit}}");
+    if git_output(root, &["cat-file", "-e", &spec]).is_some() {
+        return Ok(());
+    }
+    if let Some(remote) = github_fetch_remote(root) {
+        let _ = git_output(root, &["fetch", "--no-tags", "--depth", "1", &remote, oid]);
+    }
+    if git_output(root, &["cat-file", "-e", &spec]).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "Missing git commit {oid}. Fetch the pull request refs and try again."
+    ))
+}
+
+fn github_fetch_remote(root: &Path) -> Option<String> {
+    if let Some(name) = gh_resolved_remote(root) {
+        return Some(name);
+    }
+    if let Some(url) = gh_repo_view_url(root) {
+        if let Some(name) = remote_matching_github_url(root, &url) {
+            return Some(name);
+        }
+    }
+    git_remote_name(root)
+}
+
+fn gh_resolved_remote(root: &Path) -> Option<String> {
+    let listed = git_stdout(
+        root,
+        &["config", "--get-regexp", r"remote\..*\.gh-resolved"],
+    )?;
+    for line in listed.lines() {
+        let key = line.split_whitespace().next()?;
+        let name = key.strip_prefix("remote.")?.strip_suffix(".gh-resolved")?;
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn gh_repo_view_url(root: &Path) -> Option<String> {
+    let text = gh_stdout(root, &["repo", "view", "--json", "url"])?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("url")?
+        .as_str()
+        .map(str::to_owned)
+        .filter(|url| !url.trim().is_empty())
+}
+
+fn remote_matching_github_url(root: &Path, url: &str) -> Option<String> {
+    let remotes = git_stdout(root, &["remote", "-v"])?;
+    let wanted = normalize_github_remote_url(url);
+    for line in remotes.lines() {
+        let mut parts = line.split_whitespace();
+        let name = parts.next()?;
+        let remote_url = parts.next()?;
+        if normalize_github_remote_url(remote_url) == wanted {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_github_remote_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some((_, rest)) = trimmed.split_once("github.com:") {
+        return format!(
+            "github.com/{}",
+            rest.trim_start_matches('/').to_ascii_lowercase()
+        );
+    }
+    if let Some((_, rest)) = trimmed.split_once("github.com/") {
+        return format!(
+            "github.com/{}",
+            rest.trim_start_matches('/').to_ascii_lowercase()
+        );
+    }
+    trimmed.to_ascii_lowercase()
 }
 
 fn parse_github_pr_diff_meta(json: &str) -> Result<GitHubPrDiff, String> {
@@ -2556,6 +4251,10 @@ fn parse_github_work_items(
         url: String,
         state: String,
         #[serde(default)]
+        state_reason: String,
+        #[serde(default)]
+        created_at: String,
+        #[serde(default)]
         updated_at: String,
         #[serde(default)]
         labels: Vec<RowLabel>,
@@ -2573,6 +4272,8 @@ fn parse_github_work_items(
             title: row.title,
             url: row.url,
             state: row.state.to_lowercase(),
+            state_reason: row.state_reason.to_lowercase(),
+            created_at: row.created_at,
             updated_at: row.updated_at,
             labels: row
                 .labels
@@ -2682,13 +4383,126 @@ fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
     gh_run(root, args, false)
 }
 
+struct GitHubRateLimitBackoff {
+    until: SystemTime,
+    error: String,
+}
+
+// Shared by all webviews, including background Inbox and PR checks requests.
+static GITHUB_RATE_LIMIT_BACKOFF: Mutex<Option<GitHubRateLimitBackoff>> = Mutex::new(None);
+
 fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, String> {
+    gh_with_backoff(
+        &GITHUB_RATE_LIMIT_BACKOFF,
+        args,
+        allow_empty,
+        |args, allow_empty| gh_run_raw(root, args, allow_empty),
+    )
+}
+
+fn github_rate_limit_error(
+    backoff: &mut Option<GitHubRateLimitBackoff>,
+    now: SystemTime,
+) -> Option<String> {
+    if let Some(active) = backoff.as_ref().filter(|active| now < active.until) {
+        return Some(active.error.clone());
+    }
+    *backoff = None;
+    None
+}
+
+fn gh_with_backoff(
+    backoff: &Mutex<Option<GitHubRateLimitBackoff>>,
+    args: &[&str],
+    allow_empty: bool,
+    mut run: impl FnMut(&[&str], bool) -> Result<String, String>,
+) -> Result<String, String> {
+    if let Ok(mut slot) = backoff.lock() {
+        if let Some(error) = github_rate_limit_error(&mut slot, SystemTime::now()) {
+            return Err(error);
+        }
+    }
+    let result = run(args, allow_empty);
+    let Err(error) = &result else {
+        return result;
+    };
+    let message = error.to_lowercase();
+    let primary = message.contains("api rate limit") && message.contains("exceeded");
+    let secondary = message.contains("secondary rate limit") || message.contains("abuse detection");
+    if !primary && !secondary {
+        return result;
+    }
+    // Stop other requests immediately and resolve the reset once. If GitHub
+    // cannot return it, retry after a minute rather than hammering the API.
+    if let Ok(mut slot) = backoff.lock() {
+        if github_rate_limit_error(&mut slot, SystemTime::now()).is_some() {
+            return result;
+        }
+        *slot = Some(GitHubRateLimitBackoff {
+            until: SystemTime::now() + Duration::from_secs(60),
+            error: error.clone(),
+        });
+    } else {
+        return result;
+    }
+    if primary && message.contains("graphql") {
+        // The REST /rate_limit endpoint can disagree with the live GraphQL
+        // quota. Query the same resource that reported the exhausted budget.
+        let reset = run(
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query=query { rateLimit { remaining resetAt } }",
+            ],
+            false,
+        )
+        .and_then(|json| parse_github_rate_limit_backoff(&json));
+        if let Ok(until) = reset {
+            if let Ok(mut slot) = backoff.lock() {
+                *slot = until
+                    .filter(|until| *until > SystemTime::now())
+                    .map(|until| GitHubRateLimitBackoff {
+                        until,
+                        error: error.clone(),
+                    });
+            }
+        }
+    }
+    result
+}
+
+fn parse_github_rate_limit_backoff(json: &str) -> Result<Option<SystemTime>, String> {
+    let response: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let rate = &response["data"]["rateLimit"];
+    let remaining = rate["remaining"]
+        .as_u64()
+        .ok_or("GitHub did not return its remaining quota")?;
+    if remaining > 0 {
+        return Ok(None);
+    }
+    let reset = rate["resetAt"]
+        .as_str()
+        .ok_or("GitHub did not return its rate-limit reset")?;
+    let reset = time::OffsetDateTime::parse(reset, &time::format_description::well_known::Rfc3339)
+        .map_err(|error| error.to_string())?
+        .unix_timestamp();
+    let seconds = u64::try_from(reset).map_err(|error| error.to_string())?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds.saturating_add(1)))
+        .map(Some)
+        .ok_or_else(|| "Invalid GitHub rate-limit reset".into())
+}
+
+fn gh_run_raw(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, String> {
     let program = crate::harness::resolve_gui_binary("gh")
         .ok_or_else(|| "GitHub CLI (`gh`) is not installed.".to_string())?;
     let mut cmd = Command::new(&program);
     cmd.current_dir(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")
         .env("GIT_PAGER", "cat");
     crate::harness::apply_gui_env(&mut cmd);
@@ -2739,14 +4553,37 @@ pub(crate) fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, S
     Ok(relative)
 }
 
+/// Any git can start a filter: in an LFS repo `status`, `diff`, `add`, and
+/// checkouts all run `git-lfs`, which a Finder launch's bare PATH lacks. The
+/// cached search path finds it without waiting on the login shell.
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
+    crate::background_work::configure_child(&mut cmd);
     crate::hide_window_console(&mut cmd);
+    cmd.env("PATH", crate::harness::cached_gui_search_path());
     cmd
 }
 
+fn git_cmd_for_args_with_path(args: &[&str], gui_path: impl FnOnce() -> String) -> Command {
+    let mut cmd = git_cmd();
+    let args = args.strip_prefix(&["--literal-pathspecs"]).unwrap_or(args);
+    if matches!(
+        args.first().copied(),
+        Some("commit" | "push" | "pull" | "fetch" | "clone")
+    ) {
+        // Signers, hooks, and credential helpers may only be on the login-shell PATH.
+        cmd.env("PATH", gui_path());
+    }
+    cmd
+}
+
+fn git_cmd_for_args(args: &[&str]) -> Command {
+    git_cmd_for_args_with_path(args, crate::harness::gui_search_path)
+}
+
 pub(crate) fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
-    let output = git_cmd()
+    let mut cmd = git_cmd_for_args(args);
+    let output = cmd
         .arg("--no-pager")
         .arg("-C")
         .arg(root)
@@ -2780,7 +4617,7 @@ fn git_run(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = git_cmd()
+    let output = git_cmd_for_args(args)
         .arg("--no-pager")
         .arg("-C")
         .arg(root)
@@ -2789,14 +4626,134 @@ fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .ok()?;
-    if output.status.success() {
-        return Some(output.stdout);
-    }
-    // `git diff` exits 1 when the files differ.
-    if output.status.code() == Some(1) && args.first().copied() == Some("diff") {
+    if git_status_ok(&output.status, args) {
         return Some(output.stdout);
     }
     None
+}
+
+/// Queued 8 KiB chunks allowed between the git reader and the consumer.
+///
+/// `max_bytes` caps the buffer being built, not what the reader can run ahead:
+/// with an unbounded channel a slow or descheduled consumer lets the reader
+/// queue output with no limit at all. A small bound instead lets git's own
+/// stdout pipe (16 KiB on macOS, 64 KiB on Linux) fill and stall the child, so
+/// a read now holds `max_bytes` plus this queue, one scratch chunk, and the
+/// kernel's pipe — not `max_bytes` alone.
+///
+/// Cancelling is unaffected: the receiver is dropped on return, which unblocks
+/// a reader parked in `send`. A reader parked in `read` instead is a different
+/// case, and `stop` explains why that one is left detached.
+const GIT_OUTPUT_QUEUE_CHUNKS: usize = 16;
+
+pub(crate) fn git_output_capped(
+    root: &Path,
+    args: &[&str],
+    max_bytes: usize,
+    cancel: Option<&AtomicBool>,
+) -> Option<(Vec<u8>, bool)> {
+    let mut child = git_cmd()
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (sender, receiver) = mpsc::sync_channel(GIT_OUTPUT_QUEUE_CHUNKS);
+    let reader = thread::Builder::new()
+        .name("git-output-reader".to_string())
+        .spawn(move || {
+            let mut chunk = vec![0u8; 8192];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => {
+                        let _ = sender.send(Ok(Vec::new()));
+                        break;
+                    }
+                    Ok(read) => {
+                        if sender.send(Ok(chunk[..read].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+    let mut reader = match reader {
+        Ok(reader) => Some(reader),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let stop = |child: &mut std::process::Child, reader: &mut Option<thread::JoinHandle<()>>| {
+        let _ = child.kill();
+        let _ = child.wait();
+        // Dropping the handle detaches the reader. A killed git process can leave
+        // a shell descendant holding the pipe, so joining here would re-block the
+        // cancelled search until that unrelated descendant exits.
+        reader.take();
+    };
+
+    let mut buf = Vec::new();
+    loop {
+        if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+            stop(&mut child, &mut reader);
+            return None;
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Ok(chunk)) => {
+                let remaining = max_bytes.saturating_sub(buf.len());
+                if chunk.len() > remaining {
+                    buf.extend_from_slice(&chunk[..remaining]);
+                    stop(&mut child, &mut reader);
+                    return Some((buf, true));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(Err(_)) => {
+                stop(&mut child, &mut reader);
+                return None;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_some_and(|token| token.load(Ordering::Acquire)) {
+                    stop(&mut child, &mut reader);
+                    return None;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop(&mut child, &mut reader);
+                return None;
+            }
+        }
+    }
+    let _ = reader.take().map(thread::JoinHandle::join);
+    let status = child.wait().ok()?;
+    if git_status_ok(&status, args) {
+        Some((buf, false))
+    } else {
+        None
+    }
+}
+
+fn git_status_ok(status: &std::process::ExitStatus, args: &[&str]) -> bool {
+    status.success()
+        || (status.code() == Some(1) && matches!(args.first().copied(), Some("diff" | "grep")))
 }
 
 fn git_branch(root: &Path) -> Option<String> {
@@ -3015,6 +4972,7 @@ struct GitSync {
     ahead: i64,
     behind: i64,
     ahead_of_default: i64,
+    head_pushed: bool,
 }
 
 fn git_sync_for(root: &Path) -> GitSync {
@@ -3037,6 +4995,17 @@ fn git_sync_for(root: &Path) -> GitSync {
     } else {
         ahead
     };
+    let head_pushed = git_stdout(
+        root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            "HEAD",
+            "refs/remotes",
+        ],
+    )
+    .is_some();
     GitSync {
         remote,
         upstream,
@@ -3044,6 +5013,7 @@ fn git_sync_for(root: &Path) -> GitSync {
         ahead,
         behind,
         ahead_of_default,
+        head_pushed,
     }
 }
 
@@ -3130,13 +5100,52 @@ fn file_name(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn walk_project_files(root: &Path) -> Vec<ProjectFile> {
+/// When a file walk should stop early.
+///
+/// The flag variant is what a search uses. `AfterEntries` exists so the
+/// per-entry check can be tested without a thread and a sleep: setting the flag
+/// from outside only proves the walk stops *somewhere*, which the up-front
+/// check would satisfy on its own, and timing a real cancellation is flaky on
+/// loaded CI.
+#[derive(Clone, Copy)]
+enum WalkStop<'a> {
+    Never,
+    Flag(&'a AtomicBool),
+    #[cfg(test)]
+    AfterEntries(usize),
+}
+
+impl<'a> WalkStop<'a> {
+    fn stopped(&self, _entries: usize) -> bool {
+        match self {
+            WalkStop::Never => false,
+            WalkStop::Flag(flag) => flag.load(Ordering::Acquire),
+            #[cfg(test)]
+            WalkStop::AfterEntries(limit) => _entries >= *limit,
+        }
+    }
+}
+
+impl<'a> From<Option<&'a AtomicBool>> for WalkStop<'a> {
+    fn from(cancel: Option<&'a AtomicBool>) -> Self {
+        match cancel {
+            Some(flag) => WalkStop::Flag(flag),
+            None => WalkStop::Never,
+        }
+    }
+}
+
+fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
     let ignore = Ignore::load(root);
     let mut files = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     let mut visited = 0usize;
+    let mut seen = 0usize;
 
     while let Some(dir) = dirs.pop() {
+        if stop.stopped(seen) {
+            break;
+        }
         visited += 1;
         if visited > MAX_WALK_DIRS || files.len() >= MAX_PROJECT_FILES {
             break;
@@ -3145,6 +5154,10 @@ fn walk_project_files(root: &Path) -> Vec<ProjectFile> {
             continue;
         };
         for ent in reader {
+            seen += 1;
+            if stop.stopped(seen) {
+                return files;
+            }
             let Ok(ent) = ent else { continue };
             let name = ent.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -3380,6 +5393,8 @@ fn preserves_unix_backslash_filenames() {
     assert_eq!(expand_home(r"~\literal"), PathBuf::from(r"~\literal"));
 }
 
+/// Name-only `.gitignore` subset for directories outside a git repository.
+/// Inside a repository `git check-ignore` is the source of truth.
 struct Ignore {
     exact: HashSet<String>,
     suffixes: Vec<String>,
@@ -3449,7 +5464,7 @@ fn clone_repo_sync(url: &str, parent: &str) -> Result<String, String> {
         return Err(format!("{} already exists", dest.display()));
     }
     let dest_str = dest.to_str().ok_or("Invalid destination path")?;
-    let output = git_cmd()
+    let output = git_cmd_for_args(&["clone"])
         .args(["clone", "--", url, dest_str])
         .output()
         .map_err(|e| {
@@ -3629,6 +5644,36 @@ fn read_file_base64_sync(path: &str) -> Result<String, String> {
     ))
 }
 
+/// Video containers the chat can stream; mirrors `VIDEO_MIME_TYPES` in the UI.
+const STREAMABLE_VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "webm", "ogv", "avi", "mkv", "mpg", "mpeg", "3gp", "3g2",
+];
+
+/// Let the asset protocol serve one local video, so a chat can stream it with
+/// range requests instead of reading the whole file into memory. Only that
+/// file, and only a video container, joins the scope. Returns the canonical
+/// path the caller should load.
+#[tauri::command]
+pub fn allow_video_stream(app: AppHandle, path: String) -> Result<String, String> {
+    let path = expand_home(&path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let video = is_streamable_video(&path);
+    if !video || !path.is_file() {
+        return Err("Not a video file".into());
+    }
+    app.asset_protocol_scope()
+        .allow_file(&path)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn is_streamable_video(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| STREAMABLE_VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Read a file as raw bytes for the image viewer.
 ///
 /// Returns an `ipc::Response`, which reaches the webview as an ArrayBuffer, so
@@ -3655,6 +5700,66 @@ fn read_binary_file_sync(path: &str) -> Result<Vec<u8>, String> {
         ));
     }
     std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Read an image that a Markdown document in a project shows.
+///
+/// The document is untrusted, so `path` must be relative to `root` and the
+/// file must resolve inside it with symlinks followed: a README cannot pull in
+/// a file from elsewhere on disk. The caller sniffs the bytes, as for
+/// `read_binary_file`.
+#[tauri::command]
+pub async fn read_project_image(
+    root: String,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        read_project_image_sync(Path::new(&root), Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn read_project_image_sync(root: &Path, path: &Path) -> Result<Vec<u8>, String> {
+    use std::path::Component;
+    if !path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err("Image path must stay inside the project".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let joined = root.join(path);
+    let file = std::fs::canonicalize(&joined).map_err(|e| format!("{}: {e}", joined.display()))?;
+    if !file.starts_with(&root) {
+        return Err("Image is outside the project".into());
+    }
+    let handle = std::fs::File::open(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let meta = handle
+        .metadata()
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if !meta.is_file() {
+        return Err("Not a file".into());
+    }
+    let too_large = || {
+        format!(
+            "Image is too large to show (maximum {} MB).",
+            MAX_DOCUMENT_IMAGE_BYTES / 1024 / 1024
+        )
+    };
+    if meta.len() > MAX_DOCUMENT_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    handle
+        .take(MAX_DOCUMENT_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if bytes.len() as u64 > MAX_DOCUMENT_IMAGE_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 /// Persist a pasted blob so non-image attachments have a real path.
@@ -3686,8 +5791,117 @@ fn write_attachment_sync(name: &str, data: &str) -> Result<String, String> {
         stamp,
         safe_attachment_name(name)
     ));
-    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    // A pasted screenshot can be a picture of whatever was on screen, so keep
+    // it owner-only rather than at the umask default of 0644 in a shared /tmp.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(&bytes))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn save_generated_image(
+    app: AppHandle,
+    data: String,
+    name: String,
+) -> Result<GeneratedImageAsset, String> {
+    tauri::async_runtime::spawn_blocking(move || save_generated_image_sync(&app, &data, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_generated_image_sync(
+    app: &AppHandle,
+    data: &str,
+    name: &str,
+) -> Result<GeneratedImageAsset, String> {
+    if data.len() as u64 > MAX_GENERATED_IMAGE_DATA_BYTES {
+        return Err(format!(
+            "Generated image is too large (maximum {} MB).",
+            MAX_GENERATED_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    let encoded: String = data
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|_| "Generated image data is not valid base64.".to_string())?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_GENERATED_IMAGE_BYTES {
+        return Err(format!(
+            "Generated image is too large (maximum {} MB).",
+            MAX_GENERATED_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    if !is_png(&bytes) {
+        return Err("Generated image data is not a PNG image.".into());
+    }
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(GENERATED_IMAGE_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe_name = safe_attachment_name(name);
+    let destination = dir.join(format!("{}-{}.png", Uuid::new_v4(), safe_name));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .map_err(|e| format!("{}: {e}", destination.display()))?;
+    if let Err(error) = file.write_all(&bytes) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(format!("{}: {error}", destination.display()));
+    }
+    Ok(GeneratedImageAsset {
+        path: destination.to_string_lossy().into_owned(),
+        mime_type: "image/png".into(),
+        size: bytes.len() as u64,
+    })
+}
+
+#[tauri::command]
+pub async fn delete_generated_images(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_generated_images_sync(&app, &paths))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn delete_generated_images_sync(
+    app: &AppHandle,
+    paths: &[String],
+) -> Result<(), String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(GENERATED_IMAGE_DIR)
+        .canonicalize()
+        .map_err(|error| format!("Generated image directory is unavailable: {error}"))?;
+    for path in paths {
+        let candidate = match PathBuf::from(path).canonicalize() {
+            Ok(candidate) => candidate,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !candidate.starts_with(&root) || !candidate.is_file() {
+            return Err("Invalid generated image path".into());
+        }
+        std::fs::remove_file(candidate).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 }
 
 fn safe_attachment_name(name: &str) -> String {
@@ -3739,6 +5953,43 @@ fn read_text_file_sync(path: &str) -> Result<String, String> {
         return Err("Binary files cannot be edited.".into());
     }
     String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8.".into())
+}
+
+/// A path a paired phone named under a project's working copy, refused when it
+/// resolves outside it, through `..` or a symlink alike.
+fn inside_root(root: &str, relative: &str) -> Result<PathBuf, String> {
+    let root = expand_home(root)
+        .canonicalize()
+        .map_err(|_| "Project folder is unavailable".to_string())?;
+    let path = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| "No such file or folder".to_string())?;
+    if !path.starts_with(&root) {
+        return Err("That is outside the project".into());
+    }
+    Ok(path)
+}
+
+/// A folder in a project's working copy, for the phone's file browser. Hides
+/// the repository's own `.git`.
+#[tauri::command(async)]
+pub fn mobile_list_dir(root: String, relative: String) -> Result<Vec<DirEntry>, String> {
+    let dir = inside_root(&root, &relative)?;
+    Ok(list_dir_sync(&dir)?
+        .into_iter()
+        .filter(|entry| entry.name != ".git")
+        .collect())
+}
+
+/// A text file in a project's working copy, for the phone's file browser.
+#[tauri::command]
+pub async fn mobile_read_text_file(root: String, relative: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_text_file_sync(&path_to_js(&inside_root(&root, &relative)?))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Atomically replace a text file from a temporary file in the same directory.
@@ -3962,6 +6213,13 @@ pub async fn delete_path(path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+fn dir_contains(dir: &Path, dest_parent: &Path) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dest_parent =
+        std::fs::canonicalize(dest_parent).unwrap_or_else(|_| dest_parent.to_path_buf());
+    dest_parent.starts_with(&dir)
+}
+
 fn copy_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     let from = expand_home(from);
     if !from.exists() {
@@ -3971,7 +6229,7 @@ fn copy_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     if !dest_parent.is_dir() {
         return Err(format!("{} is not a folder", dest_parent.display()));
     }
-    if from.is_dir() && dest_parent.starts_with(&from) {
+    if from.is_dir() && dir_contains(&from, &dest_parent) {
         return Err("Cannot paste a folder into itself.".into());
     }
     let name = unique_name_in(
@@ -3999,7 +6257,7 @@ fn move_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     if !dest_parent.is_dir() {
         return Err(format!("{} is not a folder", dest_parent.display()));
     }
-    if from.is_dir() && dest_parent.starts_with(&from) {
+    if from.is_dir() && dir_contains(&from, &dest_parent) {
         return Err("Cannot paste a folder into itself.".into());
     }
     let name = file_label(&from, from.to_str().unwrap_or("item"));
@@ -4022,8 +6280,16 @@ pub async fn move_path(from: String, dest_parent: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-pub fn reveal_path(path: String) -> Result<(), String> {
-    let path = expand_home(&path);
+pub async fn reveal_path(path: String) -> Result<(), String> {
+    // On Linux `xdg-open` can stay alive until the file manager window closes;
+    // waiting on it from the main thread hangs the UI.
+    tauri::async_runtime::spawn_blocking(move || reveal_path_sync(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn reveal_path_sync(path: &str) -> Result<(), String> {
+    let path = expand_home(path);
     if !path.exists() {
         return Err(format!("{}: No such file or directory", path.display()));
     }
@@ -4042,10 +6308,14 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         // explorer.exe returns 1 even when it opened the folder.
         let path_str = path.to_string_lossy().replace('/', "\\");
+        // `.arg` would wrap the whole `/select,...` switch in quotes when the
+        // path has spaces; explorer ignores a quoted switch and opens its
+        // default folder instead. Only the path itself may be quoted.
         Command::new("explorer")
-            .arg(format!("/select,{path_str}"))
+            .raw_arg(format!("/select,\"{path_str}\""))
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -4067,12 +6337,355 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+pub async fn open_path_with_default_app(path: String) -> Result<(), String> {
+    // The Tauri opener command needs a static path scope, and its detached
+    // launcher cannot report a failing `open` process back to the UI.
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = expand_home(&path);
+        if !path.is_absolute() {
+            return Err("Expected an absolute file path".to_string());
+        }
+        std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        open::that(&path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn only_video_containers_can_join_the_stream_scope() {
+        use std::path::Path;
+        assert!(is_streamable_video(Path::new("/clips/demo.MP4")));
+        assert!(is_streamable_video(Path::new("/clips/demo.webm")));
+        for path in [
+            "/home/me/.ssh/id_rsa",
+            "/notes/a.md",
+            "/shot.png",
+            "/mp4",
+            "/a.mp4.txt",
+        ] {
+            assert!(!is_streamable_video(Path::new(path)), "{path}");
+        }
+    }
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn github_rate_limit_blocks_other_commands_until_reset() {
+        let backoff = Mutex::new(None);
+        let error = "GraphQL: API rate limit already exceeded for user ID 1.";
+        let mut calls = 0;
+        let result = gh_with_backoff(&backoff, &["pr", "list"], false, |args, _| {
+            calls += 1;
+            if args[0] == "api" {
+                Ok(
+                    r#"{"data":{"rateLimit":{"remaining":0,"resetAt":"2099-01-01T00:00:00Z"}}}"#
+                        .into(),
+                )
+            } else {
+                Err(error.into())
+            }
+        });
+        assert_eq!(result.unwrap_err(), error);
+        assert_eq!(calls, 2);
+        assert_eq!(
+            gh_with_backoff(&backoff, &["issue", "view", "42"], false, |_, _| {
+                panic!("No command may reach GitHub before the reset")
+            })
+            .unwrap_err(),
+            error
+        );
+        backoff.lock().unwrap().as_mut().unwrap().until =
+            SystemTime::now() - Duration::from_secs(1);
+        assert_eq!(
+            gh_with_backoff(&backoff, &["pr", "list"], false, |_, _| Ok("fresh".into())).unwrap(),
+            "fresh"
+        );
+        assert!(backoff.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn github_rate_limit_probe_failure_still_pauses_requests() {
+        let backoff = Mutex::new(None);
+        let mut calls = 0;
+        assert!(gh_with_backoff(&backoff, &["pr", "list"], false, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err("GraphQL: API rate limit already exceeded".into())
+            } else {
+                Err("offline".into())
+            }
+        })
+        .is_err());
+        assert_eq!(calls, 2);
+        assert!(gh_with_backoff(&backoff, &["pr", "view"], false, |_, _| {
+            panic!("A failed reset lookup must not cause a request storm")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn github_secondary_rate_limit_pauses_without_a_quota_probe() {
+        let backoff = Mutex::new(None);
+        let mut calls = 0;
+        assert!(gh_with_backoff(&backoff, &["pr", "list"], false, |_, _| {
+            calls += 1;
+            Err("You have exceeded a secondary rate limit".into())
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+        assert!(backoff.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn github_network_errors_do_not_pause_other_commands() {
+        let backoff = Mutex::new(None);
+        assert!(gh_with_backoff(&backoff, &["pr", "list"], false, |_, _| {
+            Err("error connecting to api.github.com".into())
+        })
+        .is_err());
+        assert!(backoff.lock().unwrap().is_none());
+        assert!(gh_with_backoff(&backoff, &["pr", "view"], false, |_, _| {
+            Ok("fresh".into())
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn github_rate_limit_reset_parser_requires_valid_quota_data() {
+        let reset = parse_github_rate_limit_backoff(
+            r#"{"data":{"rateLimit":{"remaining":0,"resetAt":"2026-10-06T13:48:40Z"}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reset, UNIX_EPOCH + Duration::from_secs(1791294521));
+        assert!(
+            parse_github_rate_limit_backoff(r#"{"data":{"rateLimit":{"remaining":10}}}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_github_rate_limit_backoff(r#"{"errors":[{"message":"offline"}]}"#).is_err());
+        assert!(parse_github_rate_limit_backoff(
+            r#"{"data":{"rateLimit":{"remaining":0,"resetAt":"invalid"}}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn claude_shell_commands_match_only_requested_bash_tool_ids() {
+        let dir = tmp("claude-shell-commands");
+        let path = dir.0.join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"toolu_one","name":"Bash","input":{"command":"npm test"}},
+                {"type":"tool_use","id":"toolu_read","name":"Read","input":{"command":"ignore"}}
+            ]}}),
+            serde_json::json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"toolu_two","name":"Bash","input":{"command":"git status"}}
+            ]}}),
+        ];
+        std::fs::write(&path, records.map(|record| record.to_string()).join("\n")).unwrap();
+        let commands =
+            claude_shell_commands_from_file(&path, &["toolu_one".into(), "toolu_read".into()])
+                .unwrap();
+        assert_eq!(
+            commands,
+            HashMap::from([("toolu_one".into(), "npm test".into())])
+        );
+    }
+
+    fn assistant_text(text: &str, concat: &str) -> OmpAssistantText {
+        OmpAssistantText {
+            text: text.into(),
+            concat: concat.into(),
+        }
+    }
+
+    #[test]
+    fn generated_image_validation_accepts_png_only() {
+        assert!(is_png(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+        assert!(!is_png(&[0xff, 0xd8, 0xff, 0x00]));
+        assert!(!is_png(b"<html>"));
+        assert!(!is_png(&[]));
+    }
+
+    #[test]
+    fn github_star_status_distinguishes_a_missing_star_from_an_unavailable_check() {
+        assert_eq!(
+            github_star_status_from_result(Ok(String::new())),
+            GitHubStarStatus::Starred
+        );
+        assert_eq!(
+            github_star_status_from_result(Err("gh: Not Found (HTTP 404)".into())),
+            GitHubStarStatus::NotStarred
+        );
+        assert_eq!(
+            github_star_status_from_result(Err("GitHub CLI is not installed".into())),
+            GitHubStarStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn omp_active_assistant_texts_keep_active_message_order_with_both_forms() {
+        let dir = tmp("omp-active-texts");
+        let path = dir.0.join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"message","id":"u","message":{"role":"user","content":"User only"}}),
+            serde_json::json!({"type":"message","id":"abandoned","parentId":"u","message":{"role":"assistant","content":"Off branch"}}),
+            serde_json::json!({"type":"message","id":"a","parentId":"u","message":{"role":"assistant","content":[{"type":"text","text":"First."},{"type":"thinking","thinking":"Hidden"},{"type":"text","text":"Second."}]}}),
+            serde_json::json!({"type":"message","id":"tool","parentId":"a","message":{"role":"assistant","content":[{"type":"toolCall","name":"read"}]}}),
+            serde_json::json!({"type":"message","id":"b","parentId":"tool","message":{"role":"assistant","content":"Plain"}}),
+            serde_json::json!({"type":"custom_message","id":"note","parentId":"b","content":"Note only"}),
+        ];
+        let jsonl = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        std::fs::write(&path, jsonl).unwrap();
+        assert_eq!(
+            active_omp_assistant_texts(&path).unwrap(),
+            [
+                assistant_text("First.\nSecond.", "First.Second."),
+                assistant_text("Plain", "Plain"),
+            ]
+        );
+    }
+
+    #[test]
+    fn omp_active_assistant_texts_repeat_equal_messages_in_file_order() {
+        let dir = tmp("omp-active-texts-repeats");
+        let path = dir.0.join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"message","id":"a","message":{"role":"assistant","content":"First."}}),
+            serde_json::json!({"type":"message","id":"off","parentId":"a","message":{"role":"assistant","content":"First.Second."}}),
+            serde_json::json!({"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"Second."}]}}),
+            serde_json::json!({"type":"message","id":"c","parentId":"b","message":{"role":"assistant","content":"First.Second."}}),
+            serde_json::json!({"type":"message","id":"d","parentId":"c","message":{"role":"assistant","content":"First.Second."}}),
+        ];
+        std::fs::write(
+            &path,
+            records.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        assert_eq!(
+            active_omp_assistant_texts(&path).unwrap(),
+            [
+                assistant_text("First.", "First."),
+                assistant_text("Second.", "Second."),
+                assistant_text("First.Second.", "First.Second."),
+                assistant_text("First.Second.", "First.Second."),
+            ]
+        );
+    }
+
+    #[test]
+    fn omp_interjections_require_displayed_assistant_anchors() {
+        let dir = tmp("omp-interjections");
+        let path = dir.0.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"message\",\"id\":\"u\",\"message\":{\"role\":\"user\",\"content\":\"Go\"}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"orphan\",\"parentId\":\"u\",\"display\":true}\n",
+                "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"orphan\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Answer\"}]}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"hidden\",\"parentId\":\"a1\",\"display\":false}\n",
+                "invalid partial line\n",
+                "{\"type\":\"message\",\"id\":\"a2\",\"parentId\":\"hidden\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Answer\"}]}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"review\",\"parentId\":\"a2\",\"display\":true,\"customType\":\"advisor\",\"details\":{\"notes\":[{\"note\":\"First\",\"severity\":\"nit\"},{\"note\":\"Second\",\"severity\":\"blocker\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"a3\",\"parentId\":\"review\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Checked\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let anchors = parse_omp_interjections(&path).unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].after_assistant_text, "Answer");
+        assert_eq!(anchors[0].after_occurrence, 2);
+        assert_eq!(
+            anchors[0].following_assistant_text.as_deref(),
+            Some("Checked")
+        );
+        assert_eq!(anchors[0].text, "First\n\nSecond");
+        assert_eq!(anchors[0].severity.as_deref(), Some("blocker"));
+    }
+
+    #[test]
+    fn omp_interjections_do_not_coalesce_across_reasoning() {
+        let dir = tmp("omp-interjections-reasoning");
+        let path = dir.0.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"message\",\"id\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":\"Answer\"}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"review\",\"parentId\":\"a\",\"display\":true,\"content\":\"Check\"}\n",
+                "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"review\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Wait\"},{\"type\":\"text\",\"text\":\"Checked\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let anchors = parse_omp_interjections(&path).unwrap();
+        assert_eq!(anchors[0].following_assistant_text, None);
+        assert_eq!(anchors[0].text, "Check");
+    }
+    #[test]
+    fn omp_interjections_follow_active_ancestry_and_keep_text_forms() {
+        let dir = tmp("omp-interjections-ancestry");
+        let path = dir.0.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"message\",\"id\":\"a\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"One\"},{\"type\":\"text\",\"text\":\"Two\"}]}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"abandoned\",\"parentId\":\"a\",\"display\":true,\"content\":\"Wrong branch\"}\n",
+                "{\"type\":\"message\",\"id\":\"t\",\"parentId\":\"a\",\"message\":{\"role\":\"toolResult\",\"content\":\"Done\"}}\n",
+                "{\"type\":\"custom_message\",\"id\":\"first\",\"parentId\":\"t\",\"display\":true,\"content\":\"First\"}\n",
+                "{\"type\":\"custom_message\",\"id\":\"second\",\"parentId\":\"first\",\"display\":true,\"content\":\"Second\"}\n",
+                "{\"type\":\"compaction\",\"id\":\"meta\",\"parentId\":\"second\"}\n",
+                "{\"type\":\"custom_message\",\"id\":\"third\",\"parentId\":\"meta\",\"display\":true,\"content\":\"Third\"}\n",
+                "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"third\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Three\"},{\"type\":\"text\",\"text\":\"Four\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let anchors = parse_omp_interjections(&path).unwrap();
+        assert_eq!(
+            anchors.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        for anchor in &anchors {
+            assert_eq!(anchor.after_assistant_text, "One\nTwo");
+            assert_eq!(anchor.after_assistant_text_concat, "OneTwo");
+            assert_eq!(anchor.after_occurrence, 1);
+            assert_eq!(anchor.after_concat_occurrence, 1);
+        }
+        assert_eq!(anchors[0].following_assistant_text, None);
+        assert_eq!(anchors[1].following_assistant_text, None);
+        assert_eq!(
+            anchors[2].following_assistant_text.as_deref(),
+            Some("Three\nFour")
+        );
+        assert_eq!(
+            anchors[2].following_assistant_text_concat.as_deref(),
+            Some("ThreeFour")
+        );
+    }
+
+    #[test]
+    fn omp_interjections_do_not_cross_users_or_empty_assistant_messages() {
+        let dir = tmp("omp-interjections-barriers");
+        let path = dir.0.join("session.jsonl");
+        for role in ["user", "assistant"] {
+            let records = [
+                serde_json::json!({"type":"message","id":"a","message":{"role":"assistant","content":"Earlier"}}),
+                serde_json::json!({"type":"message","id":"barrier","parentId":"a","message":{"role":role,"content":[]}}),
+                serde_json::json!({"type":"message","id":"tool","parentId":"barrier","message":{"role":"toolResult","content":"Done"}}),
+                serde_json::json!({"type":"custom_message","id":"note","parentId":"tool","display":true,"content":"Note"}),
+            ];
+            let jsonl = records.map(|record| record.to_string()).join("\n");
+            std::fs::write(&path, jsonl).unwrap();
+            assert!(parse_omp_interjections(&path).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn stat_files_returns_mtime_for_existing_files_only() {
@@ -4088,6 +6701,38 @@ mod tests {
         assert!(stats[0].mtime_ms.is_some());
         assert_eq!(stats[1].path, missing);
         assert!(stats[1].mtime_ms.is_none());
+    }
+
+    #[test]
+    fn project_location_follows_a_sibling_rename() {
+        let parent = tmp("project-location-rename");
+        let original = parent.0.join("monocode");
+        let renamed = parent.0.join("monocode-personal");
+        std::fs::create_dir(&original).unwrap();
+
+        let first = resolve_project_location_sync(&path_to_js(&original), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.path, path_to_js(&original));
+
+        std::fs::rename(&original, &renamed).unwrap();
+        let resolved = resolve_project_location_sync(&path_to_js(&original), Some(&first.identity))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.path, path_to_js(&renamed));
+        assert_eq!(resolved.identity, first.identity);
+    }
+
+    #[test]
+    fn project_location_does_not_guess_without_a_saved_identity() {
+        let parent = tmp("project-location-missing");
+        let missing = parent.0.join("old-name");
+        std::fs::create_dir(parent.0.join("some-project")).unwrap();
+
+        assert_eq!(
+            resolve_project_location_sync(&path_to_js(&missing), None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4124,6 +6769,53 @@ mod tests {
         let bytes = read_binary_file_sync(&file.to_string_lossy()).unwrap();
         assert_eq!(bytes, vec![0x89, b'P', b'N', b'G', 0x0d]);
         assert!(read_binary_file_sync(&dir.0.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn project_images_read_only_inside_the_project() {
+        let dir = tmp("project-image");
+        let root = dir.0.join("repo");
+        std::fs::create_dir_all(root.join(".github/readme")).unwrap();
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(root.join(".github/readme/hero.png"), png).unwrap();
+        std::fs::write(dir.0.join("secret.png"), b"secret").unwrap();
+
+        let read = |path: &str| read_project_image_sync(&root, Path::new(path));
+        assert_eq!(read(".github/readme/hero.png").unwrap(), png);
+        assert_eq!(read("./.github/readme/hero.png").unwrap(), png);
+        assert!(read("../secret.png").is_err());
+        assert!(read(".github/../../secret.png").is_err());
+        assert!(read(&dir.0.join("secret.png").to_string_lossy()).is_err());
+        assert!(read(".github").is_err());
+        assert!(read("").is_err());
+        assert!(read("missing.png").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_images_refuse_symlinks_out_of_the_project() {
+        let dir = tmp("project-image-link");
+        let root = dir.0.join("repo");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(dir.0.join("secret.png"), b"secret").unwrap();
+        std::fs::write(root.join("docs/inside.png"), b"inside").unwrap();
+        std::os::unix::fs::symlink(dir.0.join("secret.png"), root.join("leak.png")).unwrap();
+        std::os::unix::fs::symlink(&dir.0, root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("docs/inside.png"), root.join("alias.png")).unwrap();
+
+        let read = |path: &str| read_project_image_sync(&root, Path::new(path));
+        assert!(read("leak.png").is_err());
+        assert!(read("outside/secret.png").is_err());
+        assert_eq!(read("alias.png").unwrap(), b"inside");
+    }
+
+    #[test]
+    fn project_images_refuse_oversized_files() {
+        let dir = tmp("project-image-size");
+        let file = std::fs::File::create(dir.0.join("huge.png")).unwrap();
+        file.set_len(MAX_DOCUMENT_IMAGE_BYTES + 1).unwrap();
+        let error = read_project_image_sync(&dir.0, Path::new("huge.png")).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
     }
 
     #[test]
@@ -4232,6 +6924,24 @@ mod tests {
         assert!(err.contains("itself"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn copy_rejects_paste_into_self_through_a_symlink_alias() {
+        let dir = tmp("folder-alias");
+        let src = dir.0.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+        let alias = dir.0.join("alias");
+        std::os::unix::fs::symlink(&src, &alias).unwrap();
+        let src_s = src.to_string_lossy().into_owned();
+        let alias_s = alias.to_string_lossy().into_owned();
+
+        let err = copy_path_sync(&src_s, &alias_s).unwrap_err();
+        assert!(err.contains("itself"));
+        let err = move_path_sync(&src_s, &alias_s).unwrap_err();
+        assert!(err.contains("itself"));
+    }
+
     fn relative_paths(files: &[ProjectFile]) -> Vec<&str> {
         files.iter().map(|f| f.relative.as_str()).collect()
     }
@@ -4251,13 +6961,55 @@ mod tests {
         std::fs::write(dir.0.join(".gitignore"), "secret.txt\n").unwrap();
         std::fs::write(dir.0.join("secret.txt"), "nope\n").unwrap();
 
-        let files = walk_project_files(&dir.0);
+        let files = walk_project_files(&dir.0, WalkStop::Never);
         let paths = relative_paths(&files);
         assert!(paths.contains(&"app.ts"));
         assert!(paths.contains(&"src/main.ts"));
         assert!(paths.contains(&".gitignore"));
         assert!(!paths.iter().any(|r| r.contains("node_modules")));
         assert!(!paths.contains(&"secret.txt"));
+    }
+
+    #[test]
+    fn walk_stops_early_when_cancelled() {
+        let dir = tmp("index-walk-cancelled");
+        for index in 0..64 {
+            std::fs::create_dir_all(dir.0.join(format!("dir{index}"))).unwrap();
+            std::fs::write(dir.0.join(format!("dir{index}")).join("app.ts"), "x\n").unwrap();
+        }
+        let uncancelled = walk_project_files(&dir.0, WalkStop::Never);
+        assert_eq!(uncancelled.len(), 64);
+
+        let cancel = AtomicBool::new(true);
+        assert!(walk_project_files(&dir.0, WalkStop::Flag(&cancel)).is_empty());
+        // The same walk when nothing is cancelled must still see every file.
+        let live = AtomicBool::new(false);
+        assert_eq!(walk_project_files(&dir.0, WalkStop::Flag(&live)).len(), 64);
+    }
+
+    #[test]
+    fn walk_stops_between_entries_not_only_before_the_first_directory() {
+        let dir = tmp("index-walk-midway");
+        // Flat, so the entries the walk accepts are files: a tree of
+        // directories would be pushed, not collected, and stopping midway would
+        // still look empty.
+        for index in 0..64 {
+            std::fs::write(dir.0.join(format!("file{index}.ts")), "x\n").unwrap();
+        }
+        let all = walk_project_files(&dir.0, WalkStop::Never);
+        assert_eq!(all.len(), 64);
+
+        // Stopping partway through the first directory's entries is the only
+        // outcome that distinguishes the per-entry check from the up-front one:
+        // no up-front check yields all 64, a check that fires on the first
+        // directory yields 0.
+        let midway = walk_project_files(&dir.0, WalkStop::AfterEntries(5));
+        assert!(
+            !midway.is_empty() && midway.len() < all.len(),
+            "expected a partial listing, got {} of {}",
+            midway.len(),
+            all.len()
+        );
     }
 
     #[test]
@@ -4268,7 +7020,7 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("Info.plist"), "x\n").unwrap();
 
-        let files = walk_project_files(&dir.0);
+        let files = walk_project_files(&dir.0, WalkStop::Never);
         let paths = relative_paths(&files);
         assert!(paths.contains(&"app.ts"));
         assert!(!paths.iter().any(|r| r.contains("Some.app")));
@@ -4287,6 +7039,142 @@ mod tests {
     fn project_dirs_stay_indexable() {
         let dir = tmp("index-root");
         assert!(is_indexable_root(&dir.0));
+    }
+
+    fn ignored_names(entries: &[DirEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| e.ignored)
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    fn is_ignored(dir: &Path, name: &str) -> bool {
+        ignored_names(&list_dir_sync(dir).unwrap())
+            .iter()
+            .any(|n| n == name)
+    }
+
+    #[test]
+    fn inside_root_refuses_paths_that_leave_the_project() {
+        let dir = tmp("mobile-inside-root");
+        let project = dir.0.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.0.join("secret"), "").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.0.join("secret"), project.join("link")).unwrap();
+        let root = project.to_string_lossy();
+
+        assert!(inside_root(&root, "src/main.rs").is_ok());
+        assert!(inside_root(&root, "").is_ok());
+        assert!(inside_root(&root, "../secret").is_err());
+        assert!(inside_root(&root, &dir.0.join("secret").to_string_lossy()).is_err());
+        #[cfg(unix)]
+        assert!(inside_root(&root, "link").is_err());
+    }
+
+    #[test]
+    fn list_dir_sorts_numbered_names_naturally_with_folders_first() {
+        let dir = tmp("list-dir-natural-sort");
+        for name in [
+            "chapter-100.md",
+            "chapter-11.md",
+            "chapter-09.md",
+            "chapter-10.md",
+            "Chapter-2.md",
+        ] {
+            std::fs::write(dir.0.join(name), "").unwrap();
+        }
+        for name in ["volume-10", "volume-2"] {
+            std::fs::create_dir(dir.0.join(name)).unwrap();
+        }
+
+        let names: Vec<_> = list_dir_sync(&dir.0)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "volume-2",
+                "volume-10",
+                "Chapter-2.md",
+                "chapter-09.md",
+                "chapter-10.md",
+                "chapter-11.md",
+                "chapter-100.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn natural_name_sort_handles_multiple_and_large_numbers() {
+        let mut names = [
+            "part-2-chapter-10",
+            "part-10-chapter-1",
+            "part-2-chapter-2",
+            "part-2-chapter-999999999999999999999999999999",
+        ];
+        names.sort_by(|a, b| compare_natural_names(a, b));
+        assert_eq!(
+            names,
+            [
+                "part-2-chapter-2",
+                "part-2-chapter-10",
+                "part-2-chapter-999999999999999999999999999999",
+                "part-10-chapter-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_dir_marks_ignored_with_git_semantics() {
+        let dir = tmp("list-dir-git");
+        let init = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir.0)
+            .output();
+        let Ok(init) = init else { return };
+        if !init.status.success() {
+            return;
+        }
+        std::fs::write(
+            dir.0.join(".gitignore"),
+            "*.zzlog\n!keep.zzlog\n/zz-dist\nzz-build/\nnested/*.zztmp\n",
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("a.zzlog"), "x\n").unwrap();
+        std::fs::write(dir.0.join("keep.zzlog"), "x\n").unwrap();
+        std::fs::write(dir.0.join("zz-build"), "x\n").unwrap();
+        std::fs::create_dir_all(dir.0.join("zz-dist")).unwrap();
+        std::fs::create_dir_all(dir.0.join("src").join("zz-dist")).unwrap();
+        std::fs::create_dir_all(dir.0.join("nested")).unwrap();
+        std::fs::write(dir.0.join("nested").join("x.zztmp"), "x\n").unwrap();
+        std::fs::write(dir.0.join("nested").join("x.txt"), "x\n").unwrap();
+
+        assert!(is_ignored(&dir.0, ".git"));
+        assert!(is_ignored(&dir.0, "a.zzlog"));
+        assert!(!is_ignored(&dir.0, "keep.zzlog"));
+        assert!(is_ignored(&dir.0, "zz-dist"));
+        assert!(!is_ignored(&dir.0.join("src"), "zz-dist"));
+        assert!(!is_ignored(&dir.0, "zz-build"));
+        assert!(is_ignored(&dir.0.join("nested"), "x.zztmp"));
+        assert!(!is_ignored(&dir.0.join("nested"), "x.txt"));
+    }
+
+    #[test]
+    fn list_dir_falls_back_to_name_parser_outside_git() {
+        let dir = tmp("list-dir-plain");
+        std::fs::write(dir.0.join(".gitignore"), "secret.txt\n*.log\n").unwrap();
+        std::fs::write(dir.0.join("secret.txt"), "x\n").unwrap();
+        std::fs::write(dir.0.join("a.log"), "x\n").unwrap();
+        std::fs::write(dir.0.join("app.ts"), "x\n").unwrap();
+
+        let mut ignored = ignored_names(&list_dir_sync(&dir.0).unwrap());
+        ignored.sort_unstable();
+        assert_eq!(ignored, vec!["a.log", "secret.txt"]);
     }
 
     #[test]
@@ -4321,6 +7209,32 @@ mod tests {
         assert!(paths.contains(&"loose.ts"));
         assert!(!paths.contains(&"ignored.ts"));
         assert!(!paths.iter().any(|r| r.contains("node_modules")));
+    }
+
+    #[test]
+    fn a_cancelled_git_listing_does_not_return_the_index() {
+        let dir = tmp("index-git-cancel");
+        if !init_git_commit(&dir.0, &[("tracked.ts", "x\n")]) {
+            return;
+        }
+        let cancel = AtomicBool::new(true);
+        assert!(
+            git_ls_files(&dir.0, Some(&cancel)).is_none(),
+            "cancelled ls-files must not look like a missing git index"
+        );
+        // The walk still sees the file, so falling through after a cancelled
+        // `git_ls_files` would reintroduce the listing the cancel was meant
+        // to drop.
+        assert!(walk_project_files(&dir.0, WalkStop::Never)
+            .iter()
+            .any(|file| file.relative == "tracked.ts"));
+        let files =
+            list_project_files_sync_cancellable(&dir.0.to_string_lossy(), Some(&cancel)).unwrap();
+        assert!(files.is_empty());
+        assert!(git_ls_files(&dir.0, None)
+            .unwrap()
+            .iter()
+            .any(|file| file.relative == "tracked.ts"));
     }
 
     fn init_git(dir: &Path, branch: &str, origin: Option<&str>) -> bool {
@@ -4414,6 +7328,225 @@ mod tests {
     }
 
     #[test]
+    fn selected_commit_preserves_other_staged_files() {
+        let repo = tmp("selected-commit");
+        assert!(init_git_commit(
+            &repo.0,
+            &[("chosen.txt", "old\n"), ("other.txt", "old\n")]
+        ));
+        std::fs::write(repo.0.join("other.txt"), "unrelated staged\n").unwrap();
+        assert!(git(&repo.0, &["add", "other.txt"]));
+        std::fs::write(repo.0.join("chosen.txt"), "partial staging\n").unwrap();
+        assert!(git(&repo.0, &["add", "chosen.txt"]));
+        std::fs::write(repo.0.join("chosen.txt"), "chosen working tree\n").unwrap();
+
+        git_commit_selected_for(&repo.0, "Selected only", &["chosen.txt".into()]).unwrap();
+        assert_eq!(
+            git_stdout(&repo.0, &["show", "HEAD:chosen.txt"]).as_deref(),
+            Some("chosen working tree")
+        );
+        assert_eq!(
+            git_stdout(&repo.0, &["show", "HEAD:other.txt"]).as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            git_stdout(&repo.0, &["show", ":other.txt"]).as_deref(),
+            Some("unrelated staged")
+        );
+        assert_eq!(
+            git_stdout(&repo.0, &["diff", "--cached", "--name-only"]).as_deref(),
+            Some("other.txt")
+        );
+        // The existing whole-index workflow remains available to other panels.
+        git_commit_for(&repo.0, "Remaining staged work").unwrap();
+        assert_eq!(
+            git_stdout(&repo.0, &["show", "HEAD:other.txt"]).as_deref(),
+            Some("unrelated staged")
+        );
+    }
+
+    #[test]
+    fn selected_context_keeps_index_and_excluded_content_private() {
+        let repo = tmp("selected-context");
+        assert!(init_git_commit(
+            &repo.0,
+            &[
+                ("chosen.txt", "old\n"),
+                ("secret.txt", "old\n"),
+                ("deleted.txt", "gone\n")
+            ]
+        ));
+        std::fs::write(repo.0.join("secret.txt"), "EXCLUDED_SECRET\n").unwrap();
+        std::fs::write(repo.0.join("chosen.txt"), "partial staging\n").unwrap();
+        assert!(git(&repo.0, &["add", "."]));
+        std::fs::write(repo.0.join("chosen.txt"), "selected work\n").unwrap();
+        std::fs::write(repo.0.join("new.txt"), "selected new\n").unwrap();
+        std::fs::remove_file(repo.0.join("deleted.txt")).unwrap();
+        assert!(git(&repo.0, &["add", "deleted.txt"]));
+        let index = std::fs::read(repo.0.join(".git/index")).unwrap();
+        let head = git_stdout(&repo.0, &["rev-parse", "HEAD"]);
+        let paths = vec!["chosen.txt".into(), "new.txt".into(), "deleted.txt".into()];
+
+        let context = git_selected_context_for(&repo.0, &paths).unwrap();
+        assert!(context.patch.contains("+selected work"));
+        assert!(context.patch.contains("+selected new"));
+        assert!(context.patch.contains("-gone"));
+        assert!(!context.patch.contains("EXCLUDED_SECRET"));
+        assert!(!context.summary.contains("secret.txt"));
+        assert_eq!(std::fs::read(repo.0.join(".git/index")).unwrap(), index);
+        assert_eq!(git_stdout(&repo.0, &["rev-parse", "HEAD"]), head);
+
+        git_commit_selected_for(&repo.0, "Add and delete selected files", &paths).unwrap();
+        assert_eq!(
+            git_stdout(&repo.0, &["show", "HEAD:new.txt"]).as_deref(),
+            Some("selected new")
+        );
+        assert!(git_stdout(&repo.0, &["show", "HEAD:deleted.txt"]).is_none());
+        assert_eq!(
+            git_stdout(&repo.0, &["show", ":secret.txt"]).as_deref(),
+            Some("EXCLUDED_SECRET")
+        );
+    }
+
+    #[test]
+    fn selected_files_work_without_a_head() {
+        let repo = tmp("selected-unborn");
+        assert!(init_git(&repo.0, "main", None));
+        std::fs::write(repo.0.join("chosen.txt"), "chosen\n").unwrap();
+        std::fs::write(repo.0.join("other.txt"), "other\n").unwrap();
+        assert!(git(&repo.0, &["add", "other.txt"]));
+        let paths = vec!["chosen.txt".into()];
+        assert!(git_selected_context_for(&repo.0, &paths)
+            .unwrap()
+            .patch
+            .contains("+chosen"));
+        git_commit_selected_for(&repo.0, "First selected commit", &paths).unwrap();
+        assert_eq!(
+            git_stdout(&repo.0, &["ls-tree", "--name-only", "HEAD"]).as_deref(),
+            Some("chosen.txt")
+        );
+        assert_eq!(
+            git_stdout(&repo.0, &["diff", "--cached", "--name-only"]).as_deref(),
+            Some("other.txt")
+        );
+    }
+
+    #[test]
+    fn selected_paths_reject_directories_and_other_repositories_before_staging() {
+        let repo = tmp("selected-invalid");
+        assert!(init_git_commit(&repo.0, &[("chosen.txt", "old\n")]));
+        let nested = repo.0.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert!(init_git_commit(&nested, &[("file.txt", "nested\n")]));
+        std::fs::create_dir(repo.0.join("missing-folder")).unwrap();
+        std::fs::write(repo.0.join("missing-folder/child.txt"), "child\n").unwrap();
+        assert!(git(&repo.0, &["add", "missing-folder/child.txt"]));
+        std::fs::remove_dir_all(repo.0.join("missing-folder")).unwrap();
+        std::fs::write(repo.0.join("chosen.txt"), "unstaged\n").unwrap();
+        let index = std::fs::read(repo.0.join(".git/index")).unwrap();
+        for invalid in [
+            "",
+            "../escape",
+            ".git/config",
+            "./chosen.txt",
+            "nested/file.txt",
+            "missing-folder",
+            "absent.txt",
+        ] {
+            let paths = vec!["chosen.txt".into(), invalid.into()];
+            assert!(
+                git_commit_selected_for(&repo.0, "Invalid", &paths).is_err(),
+                "{invalid}"
+            );
+            assert!(
+                git_selected_context_for(&repo.0, &paths).is_err(),
+                "{invalid}"
+            );
+            assert_eq!(std::fs::read(repo.0.join(".git/index")).unwrap(), index);
+        }
+        assert!(git_commit_selected_for(&repo.0, "Empty", &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_filenames_are_literal() {
+        let repo = tmp("selected-literal");
+        assert!(init_git_commit(&repo.0, &[("other.txt", "old\n")]));
+        std::fs::write(repo.0.join("other.txt"), "excluded\n").unwrap();
+        let paths: Vec<String> = [
+            "*",
+            ":(glob)*",
+            "-flag",
+            "line\nbreak",
+            "back\\slash",
+            "hello é.txt",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for path in &paths {
+            std::fs::write(repo.0.join(path), "literal file\n").unwrap();
+        }
+        git_commit_selected_for(&repo.0, "Literal filenames", &paths).unwrap();
+        assert_eq!(
+            git_stdout(&repo.0, &["show", "HEAD:other.txt"]).as_deref(),
+            Some("old")
+        );
+        for path in paths {
+            assert_eq!(
+                git_stdout(&repo.0, &["show", &format!("HEAD:{path}")]).as_deref(),
+                Some("literal file")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_symlinks_do_not_read_or_commit_outside_files() {
+        use std::os::unix::fs::symlink;
+        let repo = tmp("selected-symlinks");
+        let outside = tmp("selected-outside");
+        assert!(init_git_commit(&repo.0, &[("chosen.txt", "old\n")]));
+        std::fs::write(outside.0.join("secret.txt"), "OUTSIDE_SECRET\n").unwrap();
+        symlink(outside.0.join("secret.txt"), repo.0.join("file-link")).unwrap();
+        symlink(&outside.0, repo.0.join("dir-link")).unwrap();
+        let context = git_selected_context_for(&repo.0, &["file-link".into()]).unwrap();
+        assert!(!context.patch.contains("OUTSIDE_SECRET"));
+        assert!(context.patch.contains("new file mode 120000"));
+        assert!(git_selected_context_for(&repo.0, &["dir-link/secret.txt".into()]).is_err());
+        assert!(
+            git_commit_selected_for(&repo.0, "Escape", &["dir-link/secret.txt".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn locate_files_distinguishes_repos_worktrees_and_deleted_parents() {
+        let home = tmp("locate-files");
+        let a = home.0.join("a");
+        let b = home.0.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        assert!(init_git_commit(&a, &[("file.txt", "a\n")]));
+        assert!(init_git_commit(&b, &[("file.txt", "b\n")]));
+        let tree = home.0.join("worktree");
+        assert!(git(
+            &a,
+            &["worktree", "add", "-b", "other", tree.to_str().unwrap()]
+        ));
+        for (root, relative) in [
+            (&a, "deleted/folder/file.txt"),
+            (&b, "file.txt"),
+            (&tree, "file.txt"),
+        ] {
+            let canonical = std::fs::canonicalize(root).unwrap();
+            let location = git_locate_file(&root.join(relative)).unwrap().unwrap();
+            assert_eq!(std::fs::canonicalize(&location.root).unwrap(), canonical);
+            assert_eq!(location.relative, relative);
+        }
+        assert_eq!(git_locate_file(&home.0.join("outside.txt")).unwrap(), None);
+    }
+
+    #[test]
     fn git_diff_stats_are_zero_outside_a_repo() {
         let dir = tmp("git-diff-none");
         std::fs::write(dir.0.join("notes.txt"), "hello\n").unwrap();
@@ -4491,6 +7624,76 @@ mod tests {
         assert_eq!(untracked.status, "untracked");
         assert_eq!(untracked.additions, 2);
         assert_eq!(untracked.deletions, 0);
+    }
+
+    #[test]
+    fn git_diff_index_keeps_literal_non_ascii_paths() {
+        let dir = tmp("git-diff-quoted-path");
+        if !init_git_commit(&dir.0, &[("한글.md", "before\n"), ("my file.txt", "one\n")]) {
+            return;
+        }
+        // Default quoting would otherwise hand the Changes view a C-escaped name.
+        assert!(git(&dir.0, &["config", "core.quotePath", "true"]));
+        std::fs::write(dir.0.join("한글.md"), "before\nafter\n").unwrap();
+        std::fs::write(dir.0.join("my file.txt"), "one\ntwo\n").unwrap();
+
+        let index = git_diff_index_for(&dir.0);
+        let hangul = index
+            .files
+            .iter()
+            .find(|file| file.relative == "한글.md")
+            .unwrap();
+        assert_eq!(hangul.status, "modified");
+        assert_eq!(hangul.additions, 1);
+        assert!(hangul.unstaged);
+        assert!(!hangul.relative.contains('\\'));
+
+        let spaced = index
+            .files
+            .iter()
+            .find(|file| file.relative == "my file.txt")
+            .unwrap();
+        assert_eq!(spaced.status, "modified");
+        assert_eq!(spaced.additions, 1);
+
+        let diff = git_file_diff_for(&dir.0, "한글.md", false).unwrap();
+        assert_eq!(diff.relative, "한글.md");
+        assert!(diff.current.contains("after"));
+    }
+
+    #[test]
+    fn git_diff_files_keep_paths_relative_to_nested_workspace() {
+        let dir = tmp("git-diff-nested-workspace");
+        let workspace = dir.0.join("sub");
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+        assert!(init_git_commit(
+            &dir.0,
+            &[("sub/file.txt", "original\n"), ("sub/second.txt", "old\n")],
+        ));
+        std::fs::write(workspace.join("file.txt"), "staged\n").unwrap();
+        assert!(git(&dir.0, &["add", "--", "sub/file.txt"]));
+        std::fs::write(workspace.join("second.txt"), "unstaged\n").unwrap();
+        // Without --relative this collides with the tracked sub/file.txt key.
+        std::fs::write(workspace.join("sub/file.txt"), "untracked\n").unwrap();
+
+        let changes = git_diff_files_for(&workspace);
+        assert_eq!(changes.files.len(), 3);
+        for (relative, staged, unstaged) in [
+            ("file.txt", true, false),
+            ("second.txt", false, true),
+            ("sub/file.txt", false, true),
+        ] {
+            let file = changes
+                .files
+                .iter()
+                .find(|file| file.relative == relative)
+                .unwrap();
+            assert_eq!(file.path, path_to_js(&workspace.join(relative)));
+            assert_eq!((file.staged, file.unstaged), (staged, unstaged));
+        }
+        let staged = git_file_diff_for(&workspace, "file.txt", true).unwrap();
+        assert_eq!(staged.original, "original\n");
+        assert_eq!(staged.current, "staged\n");
     }
 
     #[test]
@@ -4816,6 +8019,124 @@ mod tests {
     }
 
     #[test]
+    fn git_stage_and_unstage_directory() {
+        let dir = tmp("git-stage-directory");
+        std::fs::create_dir_all(dir.0.join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.0.join("src-other")).unwrap();
+        if !init_git_commit(
+            &dir.0,
+            &[
+                ("src/app.ts", "before\n"),
+                ("src/nested/deleted.ts", "delete me\n"),
+                ("src-other/app.ts", "before\n"),
+                ("ready.txt", "before\n"),
+                (".gitignore", "src/ignored.txt\n"),
+            ],
+        ) {
+            return;
+        }
+        std::fs::write(dir.0.join("src/app.ts"), "after\n").unwrap();
+        std::fs::remove_dir_all(dir.0.join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.0.join("src/added")).unwrap();
+        std::fs::write(dir.0.join("src/added/new.ts"), "new\n").unwrap();
+        std::fs::write(dir.0.join("src/ignored.txt"), "ignored\n").unwrap();
+        std::fs::write(dir.0.join("src-other/app.ts"), "outside\n").unwrap();
+        std::fs::write(dir.0.join("ready.txt"), "ready\n").unwrap();
+        git_stage_file_for(&dir.0, "ready.txt").unwrap();
+
+        git_stage_file_for(&dir.0, "src").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 5);
+        for file in &index.files {
+            let in_folder = file.relative.starts_with("src/");
+            assert_eq!(file.staged, in_folder || file.relative == "ready.txt");
+            assert_eq!(file.unstaged, file.relative == "src-other/app.ts");
+        }
+
+        git_unstage_file_for(&dir.0, "src").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 5);
+        for file in &index.files {
+            assert_eq!(file.staged, file.relative == "ready.txt");
+            assert_eq!(file.unstaged, file.relative != "ready.txt");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("src/app.ts")).unwrap(),
+            "after\n"
+        );
+        assert!(!dir.0.join("src/nested").exists());
+    }
+
+    #[test]
+    fn git_stage_and_unstage_deleted_directory() {
+        let dir = tmp("git-stage-deleted-directory");
+        std::fs::create_dir_all(dir.0.join("deleted/nested")).unwrap();
+        if !init_git_commit(&dir.0, &[("deleted/nested/file.ts", "before\n")]) {
+            return;
+        }
+        std::fs::remove_dir_all(dir.0.join("deleted")).unwrap();
+        git_stage_file_for(&dir.0, "deleted").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 1);
+        assert!(index.files[0].staged);
+        assert!(!index.files[0].unstaged);
+
+        git_unstage_file_for(&dir.0, "deleted").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 1);
+        assert!(!index.files[0].staged);
+        assert!(index.files[0].unstaged);
+        assert!(!dir.0.join("deleted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_stage_and_unstage_literal_directory_names() {
+        for folder in ["*", "folder?", "[ab]", ":(glob)*"] {
+            let dir = tmp("git-stage-literal-directory");
+            for directory in [folder, "a", "folderx"] {
+                std::fs::create_dir(dir.0.join(directory)).unwrap();
+            }
+            let inside = format!("{folder}/inside.txt");
+            let tracked = [
+                inside.as_str(),
+                "a/other.txt",
+                "folderx/other.txt",
+                "ready.txt",
+            ];
+            let initial: Vec<_> = tracked.iter().map(|path| (*path, "before\n")).collect();
+            if !init_git_commit(&dir.0, &initial) {
+                return;
+            }
+            for path in tracked {
+                std::fs::write(dir.0.join(path), "after\n").unwrap();
+            }
+            std::fs::write(dir.0.join("private.txt"), "unrelated untracked data\n").unwrap();
+            let staged_paths = || {
+                git_run(&dir.0, &["diff", "--cached", "--name-only", "-z"])
+                    .unwrap()
+                    .split('\0')
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+
+            git_stage_file_for(&dir.0, "ready.txt").unwrap();
+            git_stage_file_for(&dir.0, folder).unwrap();
+            let mut expected = vec![inside.clone(), "ready.txt".to_string()];
+            expected.sort();
+            assert_eq!(staged_paths(), expected, "stage folder {folder}");
+
+            git_unstage_file_for(&dir.0, folder).unwrap();
+            assert_eq!(staged_paths(), vec!["ready.txt"], "unstage folder {folder}");
+            assert_eq!(
+                std::fs::read_to_string(dir.0.join(&inside)).unwrap(),
+                "after\n"
+            );
+        }
+    }
+
+    #[test]
     fn git_stage_contents_stages_partial_hunk() {
         let dir = tmp("git-stage-contents");
         if !init_git_commit(&dir.0, &[("a.txt", "alpha\nbeta\ngamma\ndelta\n")]) {
@@ -4925,7 +8246,9 @@ mod tests {
         std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
         git_stage_file_for(&dir.0, "a.txt").unwrap();
         git_commit_for(&dir.0, "update a").unwrap();
-        assert!(git_diff_index_for(&dir.0).files.is_empty());
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.is_empty());
+        assert_eq!(index.head, git_stdout(&dir.0, &["rev-parse", "HEAD"]));
         assert_eq!(
             git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
             Some("update a")
@@ -4936,6 +8259,71 @@ mod tests {
     fn git_commit_rejects_empty_message() {
         let dir = tmp("git-commit-empty");
         assert!(git_commit_for(&dir.0, "   ").is_err());
+    }
+
+    #[test]
+    fn git_commit_amend_rewrites_head_with_staged_changes() {
+        let dir = tmp("git-commit-amend");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+        git_commit_amend_for(&dir.0, "amended").unwrap();
+        assert!(git_diff_index_for(&dir.0).files.is_empty());
+        assert_eq!(
+            git_stdout(&dir.0, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
+            Some("amended")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["show", "HEAD:a.txt"]).as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn git_commit_amend_rewords_without_staged_changes() {
+        let dir = tmp("git-commit-reword");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        git_commit_amend_for(&dir.0, "reworded").unwrap();
+        assert_eq!(
+            git_stdout(&dir.0, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
+            Some("reworded")
+        );
+    }
+
+    #[test]
+    fn git_head_message_returns_subject_and_body() {
+        let dir = tmp("git-head-message");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+        git_commit_for(&dir.0, "Subject line\n\nBody text").unwrap();
+        assert_eq!(
+            git_head_message_for(&dir.0).unwrap(),
+            "Subject line\n\nBody text"
+        );
+    }
+
+    #[test]
+    fn git_head_message_fails_without_commits() {
+        let dir = tmp("git-head-message-empty");
+        if !init_git(&dir.0, "main", None) {
+            return;
+        }
+        assert!(git_head_message_for(&dir.0).is_err());
     }
 
     #[test]
@@ -5035,6 +8423,41 @@ mod tests {
     }
 
     #[test]
+    fn git_sync_marks_head_pushed_without_upstream() {
+        let repo = tmp("git-pushed-repo");
+        let origin = tmp("git-pushed-origin");
+        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        if Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&origin.0)
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let origin_url = origin.0.to_string_lossy().into_owned();
+        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
+            || !git(&repo.0, &["push", "-u", "origin", "main"])
+            || !git(&repo.0, &["checkout", "-b", "feature"])
+        {
+            return;
+        }
+        std::fs::write(repo.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&repo.0, "a.txt").unwrap();
+        git_commit_for(&repo.0, "feature work").unwrap();
+        assert!(!git_diff_index_for(&repo.0).head_pushed);
+        if !git(&repo.0, &["push", "origin", "feature"]) {
+            return;
+        }
+        let index = git_diff_index_for(&repo.0);
+        assert_eq!(index.upstream, None);
+        assert!(index.head_pushed);
+    }
+
+    #[test]
     fn git_sync_pulls_then_pushes() {
         let origin = tmp("git-sync-origin");
         let a = tmp("git-sync-a");
@@ -5114,12 +8537,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_repositories_includes_a_forks_parent() {
+        let json = r#"{
+            "nameWithOwner": "EricRasputin/monocode-eric",
+            "parent": {
+                "name": "monocode",
+                "owner": { "login": "hardbeat920" }
+            }
+        }"#;
+        assert_eq!(
+            parse_github_repositories(json).unwrap(),
+            vec!["EricRasputin/monocode-eric", "hardbeat920/monocode"]
+        );
+    }
+
+    #[test]
+    fn parse_github_repositories_keeps_a_normal_repo_single() {
+        let json = r#"{
+            "nameWithOwner": "hardbeat920/monocode",
+            "parent": null
+        }"#;
+        assert_eq!(
+            parse_github_repositories(json).unwrap(),
+            vec!["hardbeat920/monocode"]
+        );
+    }
+
+    #[test]
     fn parse_github_work_items_maps_issue_fields() {
         let json = r#"[{
             "number": 5138,
             "title": "Promo codes fail to apply",
             "url": "https://github.com/acme/web/issues/5138",
             "state": "OPEN",
+            "stateReason": "",
+            "createdAt": "2026-08-20T09:00:00Z",
             "updatedAt": "2026-08-27T08:00:00Z",
             "labels": [{"name": "bug", "color": "d73a4a"}],
             "assignees": [{"login": "maya"}]
@@ -5129,6 +8581,7 @@ mod tests {
         assert_eq!(items[0].kind, "issue");
         assert_eq!(items[0].number, 5138);
         assert_eq!(items[0].state, "open");
+        assert_eq!(items[0].state_reason, "");
         assert_eq!(items[0].repo, "acme/web");
         assert_eq!(items[0].labels[0].name, "bug");
         assert_eq!(items[0].assignees[0].login, "maya");
@@ -5137,6 +8590,27 @@ mod tests {
             "https://avatars.githubusercontent.com/maya?s=64"
         );
         assert!(!items[0].draft);
+        let payload = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(payload["createdAt"], "2026-08-20T09:00:00Z");
+        assert_eq!(payload["updatedAt"], "2026-08-27T08:00:00Z");
+    }
+
+    #[test]
+    fn parse_github_work_items_reads_issue_state_reason() {
+        let json = r#"[{
+            "number": 42,
+            "title": "Ship the fix",
+            "url": "https://github.com/acme/web/issues/42",
+            "state": "CLOSED",
+            "stateReason": "COMPLETED"
+        }]"#;
+        let items = parse_github_work_items(json, "issue", "acme/web").unwrap();
+        assert_eq!(items[0].state, "closed");
+        assert_eq!(items[0].state_reason, "completed");
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap()["stateReason"],
+            "completed"
+        );
     }
 
     #[test]
@@ -5153,6 +8627,26 @@ mod tests {
         assert!(items[0].draft);
         assert!(items[0].labels.is_empty());
         assert_eq!(items[0].repo, "acme/web");
+    }
+
+    #[test]
+    fn github_work_item_creation_time_reaches_frontend() {
+        for (kind, resource) in [("pr", "pull"), ("issue", "issues")] {
+            let json = r#"{
+            "number": 12,
+            "title": "Checkout",
+            "url": "https://github.com/acme/web/pull/12",
+            "state": "OPEN",
+            "createdAt": "2026-09-01T08:00:00Z",
+            "updatedAt": "2026-09-11T08:00:00Z"
+        }"#;
+            let json = json.replace("/pull/", &format!("/{resource}/"));
+            let item = parse_github_work_item(&json, kind, "acme/web").unwrap();
+            let payload = serde_json::to_value(item).unwrap();
+            assert_eq!(payload["kind"], kind);
+            assert_eq!(payload["createdAt"], "2026-09-01T08:00:00Z");
+            assert_eq!(payload["updatedAt"], "2026-09-11T08:00:00Z");
+        }
     }
 
     #[test]
@@ -5211,6 +8705,25 @@ mod tests {
         );
         assert!(split_github_repo("monocode").is_err());
         assert!(split_github_repo("acme/web extra").is_err());
+    }
+
+    #[test]
+    fn github_pr_actions_map_to_non_interactive_gh_commands() {
+        assert_eq!(
+            github_pr_action_args("acme/web", 42, "squash").unwrap(),
+            ["pr", "merge", "42", "--repo", "acme/web", "--squash"]
+        );
+        assert_eq!(
+            github_pr_action_args("acme/web", 42, "draft").unwrap(),
+            ["pr", "ready", "42", "--repo", "acme/web", "--undo"]
+        );
+        assert_eq!(
+            github_pr_action_args("acme/web", 42, "reopen").unwrap(),
+            ["pr", "reopen", "42", "--repo", "acme/web"]
+        );
+        assert!(github_pr_action_args("acme/web", 42, "delete").is_err());
+        assert!(github_pr_action_args("acme/web", 0, "merge").is_err());
+        assert!(github_pr_action_args("invalid", 42, "merge").is_err());
     }
 
     #[test]
@@ -5467,6 +8980,561 @@ mod tests {
         assert_eq!(diff.files[0].additions, 4);
         assert_eq!(diff.patch, "");
         assert!(!diff.truncated);
+    }
+
+    #[test]
+    fn parse_github_pr_oids_reads_base_and_head() {
+        let json = r#"{
+            "baseRefOid": "aaa111",
+            "headRefOid": "bbb222",
+            "files": []
+        }"#;
+        assert_eq!(
+            parse_github_pr_oids(json).unwrap(),
+            ("aaa111".into(), "bbb222".into())
+        );
+    }
+
+    #[test]
+    fn github_status_context_keeps_its_report_time() {
+        let checks = parse_github_pr_checks(
+            r#"{
+            "headRefOid": "abc",
+            "statusCheckRollup": [{
+                "__typename": "StatusContext", "context": "External tests",
+                "state": "SUCCESS", "createdAt": "2030-01-01T10:00:00Z",
+                "targetUrl": "https://ci.example/project/web"
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            checks.checks[0].started_at.as_deref(),
+            Some("2030-01-01T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn github_pr_checks_args_target_repo_and_number() {
+        assert_eq!(
+            github_pr_checks_args("acme/web", 42).unwrap(),
+            [
+                "pr",
+                "view",
+                "42",
+                "--repo",
+                "acme/web",
+                "--json",
+                "headRefOid,statusCheckRollup"
+            ]
+        );
+        assert!(github_pr_checks_args("acme/web", 0).is_err());
+        assert!(github_pr_checks_args("invalid", 42).is_err());
+    }
+
+    #[test]
+    fn github_check_details_reads_steps_and_failure_annotations() {
+        let details = github_check_details_with("acme/web", "123", |path| {
+            match path {
+                "repos/acme/web/actions/jobs/123" => Ok(r#"{
+                    "id":123, "status":"completed", "conclusion":"failure",
+                    "check_run_url":"https://api.github.com/repos/acme/web/check-runs/456",
+                    "steps":[
+                        {"name":"Install","status":"completed","conclusion":"success"},
+                        {"name":"Run tests","status":"completed","conclusion":"failure",
+                         "started_at":"2030-01-01T10:00:00Z","completed_at":"2030-01-01T10:00:12Z"}
+                    ]
+                }"#.into()),
+                "repos/acme/web/check-runs/456/annotations?per_page=100" => Ok(r#"[
+                    {"path":"src/app.test.ts","start_line":42,"message":"Expected 2, received 1","annotation_level":"failure"}
+                ]"#.into()),
+                _ => panic!("Unexpected request: {path}"),
+            }
+        }).unwrap();
+        assert_eq!(details.steps[0].state, "pass");
+        assert_eq!(details.steps[1].state, "fail");
+        assert_eq!(details.steps[1].name, "Run tests");
+        assert_eq!(details.annotations[0].message, "Expected 2, received 1");
+        assert_eq!(details.annotations[0].line, 42);
+        assert!(details.notice.is_none());
+    }
+
+    #[test]
+    fn parse_github_pr_checks_maps_check_run_states() {
+        let json = r#"{
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "build",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "workflowName": "CI",
+                    "detailsUrl": "https://github.com/acme/web/actions/runs/1",
+                    "startedAt": "2026-09-16T10:00:00Z",
+                    "completedAt": "2026-09-16T10:05:00Z"
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "e2e",
+                    "status": "IN_PROGRESS",
+                    "conclusion": "FAILURE",
+                    "workflowName": "E2E",
+                    "detailsUrl": "https://github.com/acme/web/actions/runs/2",
+                    "startedAt": "2026-09-16T11:00:00Z"
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "scan",
+                    "status": "COMPLETED",
+                    "conclusion": "ACTION_REQUIRED"
+                }
+            ]
+        }"#;
+        let checks = parse_github_pr_checks(json).unwrap();
+        assert_eq!(checks.head_oid, "abc123");
+        assert_eq!(checks.checks.len(), 3);
+        let build = &checks.checks[0];
+        assert_eq!(build.name, "build");
+        assert_eq!(build.state, "pass");
+        assert_eq!(build.workflow, "CI");
+        assert_eq!(
+            build.url.as_deref(),
+            Some("https://github.com/acme/web/actions/runs/1")
+        );
+        assert_eq!(build.started_at.as_deref(), Some("2026-09-16T10:00:00Z"));
+        assert_eq!(build.completed_at.as_deref(), Some("2026-09-16T10:05:00Z"));
+        let e2e = &checks.checks[1];
+        assert_eq!(e2e.state, "pending");
+        assert_eq!(e2e.completed_at, None);
+        assert_eq!(checks.checks[2].state, "fail");
+    }
+
+    #[test]
+    fn parse_github_pr_checks_maps_status_context_states() {
+        let json = r#"{
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {
+                    "__typename": "StatusContext",
+                    "context": "ci/lab",
+                    "state": "SUCCESS",
+                    "targetUrl": "https://ci.example.com/1"
+                },
+                {
+                    "__typename": "StatusContext",
+                    "context": "security/scan",
+                    "state": "FAILURE",
+                    "targetUrl": "https://ci.example.com/2"
+                },
+                {
+                    "__typename": "StatusContext",
+                    "context": "legacy/status",
+                    "state": "PENDING"
+                }
+            ]
+        }"#;
+        let checks = parse_github_pr_checks(json).unwrap();
+        let lab = &checks.checks[0];
+        assert_eq!(lab.name, "ci/lab");
+        assert_eq!(lab.state, "pass");
+        assert_eq!(lab.workflow, "");
+        assert_eq!(lab.url.as_deref(), Some("https://ci.example.com/1"));
+        assert_eq!(lab.started_at, None);
+        assert_eq!(lab.completed_at, None);
+        assert_eq!(checks.checks[1].state, "fail");
+        let legacy = &checks.checks[2];
+        assert_eq!(legacy.state, "pending");
+        assert_eq!(legacy.url, None);
+    }
+
+    #[test]
+    fn parse_github_pr_checks_combines_rollup_states_and_unknown_values() {
+        let json = r#"{
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"__typename": "CheckRun", "name": "announce", "status": "COMPLETED", "conclusion": "CANCELLED"},
+                {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "TIMED_OUT"},
+                {"__typename": "CheckRun", "name": "stale", "status": "COMPLETED", "conclusion": "STALE"},
+                {"__typename": "StatusContext", "context": "deploy/expected", "state": "EXPECTED"},
+                {"__typename": "CheckRun", "name": "plan", "status": "QUEUED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let checks = parse_github_pr_checks(json).unwrap();
+        let states: Vec<&str> = checks.checks.iter().map(|c| c.state.as_str()).collect();
+        assert_eq!(
+            states,
+            ["skipping", "cancel", "fail", "unknown", "unknown", "pending"]
+        );
+    }
+
+    #[test]
+    fn parse_github_pr_checks_unknown_status_never_trusts_conclusion() {
+        let json = r#"{
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "mystery",
+                    "status": "RUNNING",
+                    "conclusion": "SUCCESS"
+                },
+                {"__typename": "CheckRun", "name": "done", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "CheckRun", "name": "legacy", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let checks = parse_github_pr_checks(json).unwrap();
+        assert_eq!(checks.checks[0].state, "unknown");
+        assert_eq!(checks.checks[1].state, "pass");
+        assert_eq!(checks.checks[2].state, "pass");
+    }
+
+    #[test]
+    fn parse_github_pr_checks_treats_missing_rollup_as_empty() {
+        let checks = parse_github_pr_checks(r#"{"headRefOid": "abc123"}"#).unwrap();
+        assert_eq!(checks.head_oid, "abc123");
+        assert!(checks.checks.is_empty());
+        let null_checks =
+            parse_github_pr_checks(r#"{"headRefOid": "abc123", "statusCheckRollup": null}"#)
+                .unwrap();
+        assert!(null_checks.checks.is_empty());
+    }
+
+    #[test]
+    fn parse_github_pr_checks_fills_missing_check_data() {
+        let json = r#"{
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "status": "COMPLETED"},
+                {"__typename": "CheckRun", "name": "legacy", "conclusion": "SUCCESS"},
+                {"context": "fallback/status", "state": "SUCCESS"}
+            ]
+        }"#;
+        let checks = parse_github_pr_checks(json).unwrap();
+        let bare = &checks.checks[0];
+        assert_eq!(bare.name, "");
+        assert_eq!(bare.workflow, "");
+        assert_eq!(bare.state, "unknown");
+        assert_eq!(bare.url, None);
+        assert_eq!(bare.started_at, None);
+        assert_eq!(bare.completed_at, None);
+        assert_eq!(checks.checks[1].state, "pass");
+        let fallback = &checks.checks[2];
+        assert_eq!(fallback.name, "fallback/status");
+        assert_eq!(fallback.state, "pass");
+        assert_eq!(fallback.workflow, "");
+    }
+
+    #[test]
+    fn parse_github_pr_checks_rejects_invalid_responses() {
+        assert!(parse_github_pr_checks("not json").is_err());
+        assert!(parse_github_pr_checks(r#"{"statusCheckRollup": []}"#).is_err());
+        assert!(parse_github_pr_checks(r#"{"headRefOid": "", "statusCheckRollup": []}"#).is_err());
+        assert!(
+            parse_github_pr_checks(r#"{"headRefOid": "abc", "statusCheckRollup": ["nope"]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_diff_full_context_includes_distant_lines() {
+        let dir = tmp("git-full-context");
+        let original = (1..=40)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if !init_git_commit(&dir.0, &[("big.txt", &original)]) {
+            return;
+        }
+        let base = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let updated = original.replace("line-30", "LINE-30");
+        std::fs::write(dir.0.join("big.txt"), &updated).unwrap();
+        if !git(&dir.0, &["add", "."]) || !git(&dir.0, &["commit", "-m", "edit"]) {
+            return;
+        }
+        let head = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let (patch, truncated) = git_diff_full_context(&dir.0, &base, &head).unwrap();
+        assert!(!truncated);
+        assert!(
+            patch.contains("line-1"),
+            "expected distant context in patch:\n{patch}"
+        );
+        assert!(patch.contains("LINE-30"), "expected changed line:\n{patch}");
+        let default = git_run(&dir.0, &["diff", &base, &head]).unwrap_or_default();
+        assert!(
+            !default.contains("line-1"),
+            "default context should omit distant lines"
+        );
+    }
+
+    #[test]
+    fn git_diff_full_context_uses_canonical_plain_output() {
+        let dir = tmp("git-full-context-canonical");
+        if !init_git_commit(&dir.0, &[("file.txt", "alpha\n")]) {
+            return;
+        }
+        let base = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(dir.0.join("file.txt"), "beta\n").unwrap();
+        if !git(&dir.0, &["add", "."]) || !git(&dir.0, &["commit", "-m", "edit"]) {
+            return;
+        }
+        let head = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let helper = dir.0.join("ext-diff.sh");
+        std::fs::write(&helper, "#!/bin/sh\necho EXTERNAL\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+        }
+        if !git(&dir.0, &["config", "color.ui", "always"])
+            || !git(&dir.0, &["config", "color.diff", "always"])
+            || !git(&dir.0, &["config", "diff.noprefix", "true"])
+            || !git(
+                &dir.0,
+                &["config", "diff.external", &helper.to_string_lossy()],
+            )
+        {
+            return;
+        }
+        let raw = git_run(&dir.0, &["diff", &format!("{base}...{head}")]).unwrap_or_default();
+        assert!(
+            raw.contains("EXTERNAL") || !raw.contains("diff --git a/file.txt b/file.txt"),
+            "hostile git settings should change a default diff:\n{raw}"
+        );
+        let (patch, truncated) = git_diff_full_context(&dir.0, &base, &head).unwrap();
+        assert!(!truncated);
+        assert!(
+            patch.contains("diff --git a/file.txt b/file.txt"),
+            "expected canonical prefixes:\n{patch}"
+        );
+        assert!(
+            !patch.contains('\u{1b}') && !patch.contains("EXTERNAL"),
+            "expected plain git diff output:\n{patch}"
+        );
+    }
+
+    #[test]
+    fn git_diff_full_context_errors_without_a_merge_base() {
+        let dir = tmp("git-full-context-unrelated");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        let base = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        if !git(&dir.0, &["checkout", "--orphan", "other"]) {
+            return;
+        }
+        let _ = std::fs::remove_file(dir.0.join("a.txt"));
+        std::fs::write(dir.0.join("b.txt"), "beta\n").unwrap();
+        if !git(&dir.0, &["add", "."]) || !git(&dir.0, &["commit", "-m", "other"]) {
+            return;
+        }
+        let head = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(git_run(&dir.0, &["merge-base", &base, &head]).is_none());
+        let two_dot = git_run(&dir.0, &["diff", &base, &head]).unwrap_or_default();
+        assert!(
+            two_dot.contains("alpha") || two_dot.contains("beta"),
+            "two-dot should invent a comparison:\n{two_dot}"
+        );
+        let err = git_diff_full_context(&dir.0, &base, &head).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("merge base"),
+            "expected merge-base error, got {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_git_commit_fetches_from_gh_resolved_remote() {
+        let remote = tmp("git-full-context-upstream");
+        if !init_git_commit(&remote.0, &[("note.txt", "hello\n")]) {
+            return;
+        }
+        let oid = git_run(&remote.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let decoy = tmp("git-full-context-origin");
+        if !init_git_commit(&decoy.0, &[("other.txt", "decoy\n")]) {
+            return;
+        }
+        let local = tmp("git-full-context-local");
+        if !init_git_commit(&local.0, &[("local.txt", "local\n")]) {
+            return;
+        }
+        let upstream_url = remote.0.to_string_lossy().into_owned();
+        let origin_url = decoy.0.to_string_lossy().into_owned();
+        if !git(&local.0, &["remote", "add", "origin", &origin_url])
+            || !git(&local.0, &["remote", "add", "upstream", &upstream_url])
+            || !git(&local.0, &["config", "remote.upstream.gh-resolved", "base"])
+        {
+            return;
+        }
+        assert_eq!(github_fetch_remote(&local.0).as_deref(), Some("upstream"));
+        let spec = format!("{oid}^{{commit}}");
+        assert!(git_output(&local.0, &["cat-file", "-e", &spec]).is_none());
+        ensure_git_commit(&local.0, &oid).unwrap();
+        assert!(git_output(&local.0, &["cat-file", "-e", &spec]).is_some());
+    }
+
+    #[test]
+    fn git_output_capped_keeps_queued_chunks_complete_and_ordered() {
+        let dir = tmp("git-output-bounded-queue");
+        // ~200 KiB, comfortably past the 128 KiB the reader queue can hold, so
+        // the reader is guaranteed to park in `send` while the consumer is
+        // behind. Every other cap test here uses a cap below a single 8 KiB
+        // chunk, which never fills one queue slot and so cannot catch a lost,
+        // duplicated, or reordered chunk.
+        let body: String = (0..12_000).map(|index| format!("line {index}\n")).collect();
+        if !init_git_commit(&dir.0, &[("many.txt", &body)]) {
+            return;
+        }
+
+        let (full, truncated) =
+            git_output_capped(&dir.0, &["show", ":many.txt"], 1 << 20, None).unwrap();
+        assert!(!truncated);
+        assert_eq!(full, body.as_bytes(), "queued chunks lost or reordered");
+
+        // Spans several chunks and lands mid-line.
+        let (capped, truncated) =
+            git_output_capped(&dir.0, &["show", ":many.txt"], 24_576, None).unwrap();
+        assert!(truncated);
+        assert_eq!(capped, body.as_bytes()[..24_576]);
+    }
+
+    #[test]
+    fn git_output_capped_stops_before_buffering_the_rest() {
+        let dir = tmp("git-output-capped");
+        let big = "x".repeat(80_000);
+        if !init_git_commit(&dir.0, &[("big.txt", &format!("{big}\n"))]) {
+            return;
+        }
+        std::fs::write(dir.0.join("big.txt"), format!("y{big}\n")).unwrap();
+        if !git(&dir.0, &["add", "."]) || !git(&dir.0, &["commit", "-m", "edit"]) {
+            return;
+        }
+        let (bytes, truncated) =
+            git_output_capped(&dir.0, &["diff", "HEAD~1", "HEAD"], 1024, None).unwrap();
+        assert!(truncated);
+        assert!(bytes.len() <= 1024);
+        let (head, truncated) =
+            git_output_capped(&dir.0, &["rev-parse", "HEAD"], 1024, None).unwrap();
+        assert!(!truncated);
+        assert!(!head.is_empty());
+    }
+
+    fn git_cmd_path(cmd: &Command) -> Vec<PathBuf> {
+        let path = cmd
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .expect("git should get an explicit PATH");
+        std::env::split_paths(path).collect()
+    }
+
+    /// git-lfs and other filters live in Homebrew dirs a Finder launch lacks.
+    #[test]
+    fn read_only_git_cmd_path_adds_fixed_dirs_to_inherited_path() {
+        let path = git_cmd_path(&git_cmd());
+        assert!(path.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(path.contains(&PathBuf::from("/usr/local/bin")));
+        if let Some(inherited) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&inherited) {
+                assert!(path.contains(&dir), "missing inherited {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_git_never_resolves_login_shell_path() {
+        for action in ["status", "diff", "add", "restore", "cat-file"] {
+            let cmd = git_cmd_for_args_with_path(&[action], || {
+                panic!("local git must not resolve the login-shell PATH")
+            });
+            assert!(git_cmd_path(&cmd).contains(&PathBuf::from("/opt/homebrew/bin")));
+        }
+    }
+
+    #[test]
+    fn git_actions_that_need_helpers_use_login_shell_path() {
+        for action in ["commit", "push", "pull", "fetch", "clone"] {
+            let cmd = git_cmd_for_args_with_path(&[action], || "gui-git-path".into());
+            assert!(cmd.get_envs().any(|(key, value)| {
+                key == std::ffi::OsStr::new("PATH")
+                    && value == Some(std::ffi::OsStr::new("gui-git-path"))
+            }));
+        }
+    }
+
+    #[test]
+    fn signing_hint_ignores_other_errors() {
+        let error = "nothing to commit, working tree clean".to_string();
+        assert_eq!(with_signing_hint(error.clone()), error);
+    }
+
+    #[test]
+    fn git_commit_reports_signing_failure_with_hint() {
+        let dir = tmp("git-commit-signing");
+        if !init_git_commit(&dir.0, &[("a.txt", "a\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "b\n").unwrap();
+        for args in [
+            ["config", "commit.gpgsign", "true"],
+            ["config", "gpg.format", "openpgp"],
+            ["config", "gpg.program", "/nonexistent/monocode-gpg"],
+        ] {
+            assert!(git(&dir.0, &args));
+        }
+        assert!(git(&dir.0, &["add", "."]));
+        let error = git_commit_for(&dir.0, "signed").unwrap_err();
+        assert!(error.contains("Git couldn't sign this commit"), "{error}");
+    }
+
+    #[test]
+    fn git_output_capped_cancels_a_silent_child() {
+        let dir = tmp("git-output-cancel-silent");
+        if !init_git_commit(&dir.0, &[("a.txt", "a\n")]) {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        let setter_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+
+        let result = git_output_capped(
+            &dir.0,
+            &["-c", "alias.slow=!sleep 5", "slow"],
+            1024,
+            Some(&cancel),
+        );
+        setter_thread.join().unwrap();
+
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

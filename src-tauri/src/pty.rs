@@ -38,6 +38,7 @@ struct PtyExit {
 }
 
 struct LivePty {
+    cwd: std::path::PathBuf,
     writer: Mutex<Box<dyn Write + Send>>,
     #[cfg(unix)]
     master_fd: i32,
@@ -51,6 +52,14 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
+    pub(crate) fn has_working_dir(&self, path: &std::path::Path) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|live| crate::worktrees::contains_working_dir(path, &live.cwd))
+    }
+
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -124,6 +133,8 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
+    let workdir = working_dir(&cwd);
+    let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
     if let Some(prev) = host.remove(&id) {
         terminate(prev.pid);
         #[cfg(unix)]
@@ -132,12 +143,12 @@ pub fn pty_spawn(
 
     #[cfg(unix)]
     {
-        spawn_unix(app, host, id, cwd, cols.max(2), rows.max(2))
+        spawn_unix(app, host, id, workdir, cols.max(2), rows.max(2))
     }
 
     #[cfg(windows)]
     {
-        spawn_windows(app, host, id, cwd, cols.max(2), rows.max(2))
+        spawn_windows(app, host, id, workdir, cols.max(2), rows.max(2))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -193,8 +204,8 @@ pub(crate) struct PtyStatus {
     foreground: Option<String>,
 }
 
-/// Off the main thread: this forks `ps`, and the title poll calls it once a
-/// second for every open terminal.
+/// Off the main thread: outside Linux a running command costs a `ps` fork,
+/// and the title poll calls it once a second for every open terminal.
 #[tauri::command(async)]
 pub fn pty_status(host: State<'_, PtyHost>, id: String) -> Result<PtyStatus, String> {
     let live = host
@@ -235,7 +246,7 @@ fn spawn_unix(
     app: AppHandle,
     host: State<PtyHost>,
     id: String,
-    cwd: String,
+    workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
@@ -244,7 +255,6 @@ fn spawn_unix(
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    let workdir = working_dir(&cwd);
     let (shell, args) = default_shell();
     let (master, slave) = open_pty(cols, rows)?;
 
@@ -293,6 +303,7 @@ fn spawn_unix(
     let writer = unsafe { File::from_raw_fd(dup_fd(master)?) };
 
     let live = Arc::new(LivePty {
+        cwd: workdir.clone(),
         writer: Mutex::new(Box::new(writer)),
         master_fd: master,
         pid,
@@ -364,13 +375,12 @@ fn spawn_windows(
     app: AppHandle,
     host: State<PtyHost>,
     id: String,
-    cwd: String,
+    workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-    let workdir = working_dir(&cwd);
     let (shell, args) = default_shell();
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -409,6 +419,7 @@ fn spawn_windows(
         .map_err(|err| format!("Failed to write to terminal: {err}"))?;
 
     let live = Arc::new(LivePty {
+        cwd: workdir.clone(),
         writer: Mutex::new(Box::new(writer)),
         master: Mutex::new(pair.master),
         pid,
@@ -580,7 +591,7 @@ fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32), String> {
 fn slave_name(master: i32) -> Result<std::ffi::CString, String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let mut buf = vec![0_i8; 64];
+        let mut buf = vec![0 as libc::c_char; 64];
         let ret = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
         if ret != 0 {
             return Err(os_err("Failed to resolve terminal name"));
@@ -694,11 +705,12 @@ fn foreground_label(master_fd: i32, shell_pid: u32) -> Option<String> {
         return None;
     }
     let pid = pgrp;
-    if pid <= 0 {
+    // An idle shell owns the foreground; settle that before any lookup.
+    if pid <= 0 || pid == shell_pid as i32 {
         return None;
     }
     let label = process_label(pid)?;
-    if pid == shell_pid as i32 || is_shell_name(&label) {
+    if is_shell_name(&label) {
         return None;
     }
     Some(label)
@@ -706,6 +718,23 @@ fn foreground_label(master_fd: i32, shell_pid: u32) -> Option<String> {
 
 #[cfg(unix)]
 fn process_label(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(label) = proc_cmdline_label(pid) {
+        return Some(label);
+    }
+    ps_label(pid)
+}
+
+/// The same argv `ps -o args=` prints, read without forking a process.
+#[cfg(target_os = "linux")]
+fn proc_cmdline_label(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args = String::from_utf8_lossy(&raw).replace('\0', " ");
+    command_label(args.trim())
+}
+
+#[cfg(unix)]
+fn ps_label(pid: i32) -> Option<String> {
     use std::process::Command;
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
@@ -777,6 +806,12 @@ mod label_tests {
         assert_eq!(command_label("cargo build"), Some("cargo".into()));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_cmdline_labels_a_live_process() {
+        assert!(proc_cmdline_label(std::process::id() as i32).is_some());
+    }
+
     #[test]
     fn shell_names_are_ignored() {
         assert!(is_shell_name("zsh"));
@@ -809,6 +844,7 @@ mod tests {
         host.insert(
             "term".into(),
             Arc::new(LivePty {
+                cwd: std::path::PathBuf::from("/test"),
                 writer: Mutex::new(Box::new(std::io::sink())),
                 master_fd: -1,
                 pid: 42,
